@@ -11,6 +11,37 @@ Sources match the structure and refresh behavior of the [official Claude plugin 
 | `agent/chats` | `name: shortText`, `title: shortText`, `url: longText` | Yes | 900 sec |
 | `agent/configured` | `name: shortText`, `configured: boolean, shortText` | No | 60 sec |
 
+Two OpenCode sources expose live activity:
+
+| Source | Items and properties | Multiple | Refresh |
+| --- | --- | --- | ---: |
+| `opencode/active_session` | `name: shortText, longText`; `title: longText`; `status: shortText, longText`; `directory: longText`; `agent: longText`; `model: longText`; `updated: timestamp`; `url: longText`; `is_subagent: boolean` | Yes | 20 sec |
+| `opencode/activity` | `name: shortText, longText`; `active_count: numericValue, shortText`; `attention_count: numericValue, shortText`; `summary: shortText, longText`; `connected: boolean`; `checked_at: timestamp` | No | 20 sec |
+
+Phone-side PebbleKitJS watchface or app consumers can subscribe to a plugin source with `Pebble.subscribeToSource`. Its single options object includes plugin UUID, category, item, and callbacks. The numeric count may be absent when a scan is incomplete:
+
+```js
+Pebble.subscribeToSource({
+  plugin: '4e2c758f-8a31-4bf2-a6d9-7c40ec9b5173',
+  category: 'opencode',
+  item: 'activity',
+  onData: ({ instances }) => {
+    const properties = instances[0]?.properties;
+    const count = properties?.active_count?.numericValue?.value;
+    console.log(typeof count === 'number' ? `${count} active` : properties?.summary?.longText?.text || 'Activity unavailable');
+  },
+  onError: error => console.log(error.code, error.message),
+});
+```
+
+`active_session` yields each active session, including subagents. A session's `name` is its nickname or title; its actual session ID remains targetable with `send_to_agent`. `agent`, `model`, and `updated` may be absent. Status precedence is `Waiting for approval` when any permission request exists, then `Waiting for input` when forms exist, otherwise `Running`. `updated` and `checked_at` are Pebble timestamps in epoch seconds, converted from OpenCode milliseconds.
+
+Active sessions represent foreground execution owned by the configured OpenCode process. They are not recent chats, background jobs, or activity in separate processes. Sessions are grouped by full root lineage in deterministic ancestry-ID order, parent before descendants. Inactive ancestors may be fetched for grouping but are not emitted as active sessions. `activity` counts root groups, not child-inclusive session instances. `attention_count` counts each root group once if any active member needs permission or input; a group with multiple requests still counts once.
+
+A successful empty lookup returns `active_session: []` and one `activity` instance with `connected: true`, both counts `0`, and summary `No active sessions`. Missing configuration, or a failed or invalid active-map lookup, returns `connected: false` with both counts omitted. If the active map validates but follow-up detail, permission/form data, or grouping fails, `connected` remains `true`, summary is `unavailable`, and both counts are omitted. Neither failure case reports zero. `checked_at` records the latest attempt. Consumers must check that counts exist even when connected. An incomplete active-session lookup rejects the `active_session` source rather than returning a fake empty list.
+
+Each subscription poll performs a fresh bounded scan; there is no persistent cache or background daemon. Limits are 100 active IDs, 200 metadata lookups, 32 parent hops, and 4 concurrent HTTP requests. Limit or cycle failures produce unavailable data, not truncated results. Activity sources use read-only GETs and need only saved server credentials; no default messaging session is required. No approval controls or additional actions are provided.
+
 The only action is `send_to_agent`, targeting `agent/chats`. It requires `message` (1–16000 characters) and accepts optional nullable `chat_id`. Omit `chat_id` to use the configured default or new-session mode. Use reserved value `new` to start a new session in the configured directory. Existing sessions can be targeted by ID, nickname, or title. Set distinct nicknames in settings; ambiguous titles fail.
 
 Manifest sets `destructive: false` and `requiresConfirmation: false`, matching Claude's UI metadata. These flags do not make actions read-only: prompts may run commands or modify files under OpenCode's configured permissions. This plugin provides no permission bypass and requests no caller permissions. Do not automatically retry uncertain delivery or conflicts.

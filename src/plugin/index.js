@@ -138,7 +138,7 @@
 
     function refresh() {
       if (root.Pebble && typeof root.Pebble.refreshSources === 'function') {
-        try { root.Pebble.refreshSources(['agent/chats', 'agent/configured']); } catch (_) {}
+        try { root.Pebble.refreshSources(['agent/chats', 'agent/configured', 'opencode/active_session', 'opencode/activity']); } catch (_) {}
       }
     }
 
@@ -286,6 +286,236 @@
       return { sessions: sessions, next_cursor: page.cursor.next };
     }
 
+    function isPlainObject(value) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+      var prototype = Object.getPrototypeOf(value);
+      return prototype === Object.prototype || prototype === null;
+    }
+
+    function unicodePrefix(value, limit) {
+      var result = '';
+      var count = 0;
+      for (var i = 0; i < value.length && count < limit; count += 1) {
+        var first = value.charCodeAt(i);
+        if (first >= 0xd800 && first <= 0xdbff && i + 1 < value.length) {
+          var second = value.charCodeAt(i + 1);
+          if (second >= 0xdc00 && second <= 0xdfff) {
+            result += value.slice(i, i + 2);
+            i += 2;
+            continue;
+          }
+        }
+        result += value.charAt(i);
+        i += 1;
+      }
+      return result;
+    }
+
+    function createLimiter(maxConcurrent) {
+      var running = 0;
+      var waiting = [];
+      var stopped = false;
+      var failure = null;
+
+      function stop(reason) {
+        if (stopped) return;
+        stopped = true;
+        failure = reason || makeError('PLUGIN_UNAVAILABLE', 'OpenCode scan failed.');
+        while (waiting.length) waiting.shift().reject(failure);
+      }
+
+      function release() {
+        running -= 1;
+        if (!stopped && waiting.length) schedule(waiting.shift());
+      }
+
+      function schedule(entry) {
+        if (stopped) {
+          entry.reject(failure);
+          return;
+        }
+        running += 1;
+        Promise.resolve().then(entry.task).then(function (value) {
+          entry.resolve(value);
+          release();
+        }, function (err) {
+          stop(err);
+          entry.reject(err);
+          release();
+        });
+      }
+
+      function limited(task) {
+        return new Promise(function (resolve, reject) {
+          var entry = { task: task, resolve: resolve, reject: reject };
+          if (stopped) reject(failure);
+          else if (running < maxConcurrent) schedule(entry);
+          else waiting.push(entry);
+        });
+      }
+      limited.stop = stop;
+      return limited;
+    }
+
+    async function activeSnapshot(state, onValidated) {
+      requireConnection(state);
+      var response = await api(state, '/session/active');
+      var activeMap = response && response.data;
+      if (!isPlainObject(activeMap)) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid active session data.');
+      var activeIDs = Object.keys(activeMap);
+      if (activeIDs.length > 100) throw makeError('PLUGIN_UNAVAILABLE', 'Too many active sessions to inspect safely.');
+      activeIDs.forEach(function (id) {
+        if (!sessionID(id) || !isPlainObject(activeMap[id]) || activeMap[id].type !== 'running') {
+          throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid active session data.');
+        }
+      });
+      if (onValidated) onValidated();
+      if (activeIDs.length === 0) return { sessions: [], attention: [], roots: [], attentionRoots: [] };
+
+      var limitRequest = createLimiter(4);
+      var metadata = Object.create(null);
+      var metadataCount = 0;
+      function fetchMetadata(id) {
+        if (metadata[id]) return metadata[id];
+        metadataCount += 1;
+        if (metadataCount > 200) throw makeError('PLUGIN_UNAVAILABLE', 'Too many sessions to inspect safely.');
+        metadata[id] = limitRequest(function () { return getSession(state, id); });
+        return metadata[id];
+      }
+      function parentOf(session) {
+        if (session.parentID === undefined || session.parentID === null) return null;
+        if (!sessionID(session.parentID)) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid parent session data.');
+        return session.parentID;
+      }
+      async function ancestry(session) {
+        var reverse = [session.id];
+        var seen = Object.create(null);
+        seen[session.id] = true;
+        var current = session;
+        var hops = 0;
+        var parentID = parentOf(current);
+        while (parentID !== null) {
+          hops += 1;
+          if (hops > 32 || seen[parentID]) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid parent session data.');
+          seen[parentID] = true;
+          var parent = await fetchMetadata(parentID);
+          if (parent.id !== parentID) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned mismatched parent session data.');
+          reverse.push(parent.id);
+          current = parent;
+          parentID = parentOf(current);
+        }
+        reverse.reverse();
+        return reverse;
+      }
+      async function attentionFor(id) {
+        var responses = await Promise.all([
+          limitRequest(function () { return api(state, sessionPath(id) + '/permission'); }),
+          limitRequest(function () { return api(state, sessionPath(id) + '/form'); })
+        ]);
+        var permissions = responses[0] && responses[0].data;
+        var forms = responses[1] && responses[1].data;
+        function validRequests(items) {
+          if (!Array.isArray(items)) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid attention data.');
+          items.forEach(function (item) {
+            if (!item || typeof item !== 'object' || Array.isArray(item) || typeof item.id !== 'string' || item.sessionID !== id) {
+              throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid attention data.');
+            }
+          });
+          return items.length > 0;
+        }
+        var hasPermissions = validRequests(permissions);
+        var hasForms = validRequests(forms);
+        if (hasPermissions) return 'permission';
+        return hasForms ? 'form' : null;
+      }
+
+      var details;
+      try {
+        details = await Promise.all(activeIDs.map(async function (id) {
+          var session = await fetchMetadata(id);
+          if (session.id !== id) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned mismatched active session data.');
+          var parentID = parentOf(session);
+          var [path, attention] = await Promise.all([ancestry(session), attentionFor(id)]);
+          return { session: session, parentID: parentID, path: path, attention: attention };
+        }));
+      } catch (scanError) {
+        limitRequest.stop(scanError);
+        throw scanError;
+      }
+      details.sort(function (a, b) {
+        var length = Math.min(a.path.length, b.path.length);
+        for (var i = 0; i < length; i += 1) {
+          if (a.path[i] < b.path[i]) return -1;
+          if (a.path[i] > b.path[i]) return 1;
+        }
+        return a.path.length - b.path.length;
+      });
+      var rootIDs = Object.create(null);
+      var attentionRoots = Object.create(null);
+      details.forEach(function (detail) {
+        var rootID = detail.path[0];
+        rootIDs[rootID] = true;
+        if (detail.attention) attentionRoots[rootID] = true;
+      });
+      return {
+        sessions: details,
+        attention: details.map(function (detail) { return detail.attention; }),
+        roots: Object.keys(rootIDs),
+        attentionRoots: Object.keys(attentionRoots)
+      };
+    }
+
+    function activeInstance(state, detail) {
+      var session = detail.session;
+      var attention = detail.attention;
+      var statusText = attention === 'permission' ? 'Approve' : attention === 'form' ? 'Input' : 'Running';
+      var statusLong = attention === 'permission' ? 'Waiting for approval' : attention === 'form' ? 'Waiting for input' : 'Running';
+      var name = state.nicknames[session.id] || titleOf(session);
+      var properties = {
+        name: { shortText: { text: unicodePrefix(name, 7) }, longText: { text: name } },
+        title: { longText: { text: titleOf(session) } },
+        status: { shortText: { text: statusText }, longText: { text: statusLong } },
+        directory: { longText: { text: session.location.directory } },
+        url: { longText: { text: sessionURL(state.url, session.id) } },
+        is_subagent: { boolean: { value: Boolean(detail.parentID) } }
+      };
+      if (typeof session.agent === 'string') properties.agent = { longText: { text: session.agent } };
+      if (session.model && typeof session.model.providerID === 'string' && session.model.providerID &&
+          typeof session.model.id === 'string' && session.model.id) {
+        properties.model = { longText: { text: session.model.providerID + '/' + session.model.id } };
+      }
+      var updated = session.time && session.time.updated;
+      if (typeof updated === 'number' && Number.isFinite(updated) && updated >= 0) {
+        properties.updated = { timestamp: { value: Math.floor(updated / 1000) } };
+      }
+      return { instanceId: session.id, properties: properties };
+    }
+
+    function activityInstance(checkedAt, connected, snapshot, failure) {
+      var properties = {
+        name: { shortText: { text: 'OpenCode' }, longText: { text: 'OpenCode' } },
+        connected: { boolean: { value: connected } },
+        checked_at: { timestamp: { value: checkedAt } }
+      };
+      if (failure) {
+        var summary = failure === 'setup' ? ['Setup', 'Connect to an OpenCode server'] :
+          failure === 'auth' ? ['Sign in', 'OpenCode authentication required'] :
+          failure === 'permission' ? ['Blocked', 'OpenCode network access denied'] :
+          ['Unknown', 'Activity unavailable'];
+        properties.summary = { shortText: { text: summary[0] }, longText: { text: summary[1] } };
+      } else {
+        var activeCount = snapshot.roots.length;
+        var attentionCount = snapshot.attentionRoots.length;
+        var shortSummary = activeCount === 0 ? 'Idle' : String(activeCount) + ' act';
+        var longSummary = activeCount === 0 ? 'No active sessions' :
+          String(activeCount) + ' active' + (attentionCount ? ', ' + String(attentionCount) + ' needs attention' : '');
+        properties.active_count = { numericValue: { value: activeCount, min: 0 }, shortText: { text: String(activeCount) } };
+        properties.attention_count = { numericValue: { value: attentionCount, min: 0 }, shortText: { text: String(attentionCount) } };
+        properties.summary = { shortText: { text: unicodePrefix(shortSummary, 7) }, longText: { text: longSummary } };
+      }
+      return { instanceId: 'opencode', properties: properties };
+    }
+
     function directoryPath(value) {
       return typeof value === 'string' && !/[\u0000-\u001f\u007f]/.test(value) &&
         (/^\/(?:[^\u0000-\u001f\u007f]*)$/.test(value) || /^[A-Za-z]:[\\/]/.test(value) || /^\\\\[^\\]+\\[^\\]+/.test(value));
@@ -404,11 +634,11 @@
     }
 
     async function source(input) {
-      if (!input || input.category !== 'agent' || (input.item !== 'chats' && input.item !== 'configured')) {
+      if (!input || typeof input.category !== 'string' || typeof input.item !== 'string') {
         throw makeError('INVALID_REQUEST', 'Unsupported source request.');
       }
       var state = await load();
-      if (input.item === 'configured') {
+      if (input.category === 'agent' && input.item === 'configured') {
         var name = state.mode === 'new_chat' ? DEFAULT_TITLE :
           (state.selected ? (state.nicknames[state.selected.session_id] || state.selected.title) : DEFAULT_TITLE);
         var ready = configured(state);
@@ -417,18 +647,52 @@
           configured: { boolean: { value: ready }, shortText: { text: ready ? 'Configured' : 'Not configured' } }
         } }] };
       }
-      requireConnection(state);
-      var page = await chatRows(state, input.cursor);
-      return {
-        validUntilMs: now() + 900000,
-        instances: page.sessions.map(function (session) {
-          return { instanceId: session.session_id, properties: {
-            name: { shortText: { text: session.nickname || session.title } },
-            title: { shortText: { text: session.title } },
-            url: { longText: { text: session.url } }
-          } };
-        })
-      };
+      if (input.category === 'agent' && input.item === 'chats') {
+        requireConnection(state);
+        var page = await chatRows(state, input.cursor);
+        return {
+          validUntilMs: now() + 900000,
+          instances: page.sessions.map(function (session) {
+            return { instanceId: session.session_id, properties: {
+              name: { shortText: { text: session.nickname || session.title } },
+              title: { shortText: { text: session.title } },
+              url: { longText: { text: session.url } }
+            } };
+          })
+        };
+      }
+      if (input.category === 'opencode' && input.item === 'active_session') {
+        var active = await activeSnapshot(state);
+        return {
+          validUntilMs: now() + 20000,
+          instances: active.sessions.map(function (detail) { return activeInstance(state, detail); })
+        };
+      }
+      if (input.category === 'opencode' && input.item === 'activity') {
+        var checkedAt = Math.floor(now() / 1000);
+        var connected = false;
+        var summary;
+        if (!state.url || !state.username || !state.password || !/^2\./.test(state.version)) {
+          summary = 'setup';
+        } else {
+          try {
+            var activity = await activeSnapshot(state, function () { connected = true; });
+            return {
+              validUntilMs: now() + 20000,
+              instances: [activityInstance(checkedAt, true, activity, null)]
+            };
+          } catch (activityError) {
+            if (activityError && activityError.code === 'AUTH_REQUIRED') summary = 'auth';
+            else if (activityError && activityError.code === 'PERMISSION_DENIED') summary = 'permission';
+            else summary = 'unavailable';
+          }
+        }
+        return {
+          validUntilMs: now() + 20000,
+          instances: [activityInstance(checkedAt, connected, null, summary)]
+        };
+      }
+      throw makeError('INVALID_REQUEST', 'Unsupported source request.');
     }
 
     function makeMessageID() {
@@ -555,7 +819,10 @@
         }
         deliveryVerified = true;
       }
-      return { text: 'Message submitted to OpenCode: ' + titleOf(session), refreshed: ['agent/chats'] };
+      return {
+        text: 'Message submitted to OpenCode: ' + titleOf(session),
+        refreshed: ['agent/chats', 'opencode/active_session', 'opencode/activity']
+      };
     }
 
     return { config: config, source: source, action: action };
