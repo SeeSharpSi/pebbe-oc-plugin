@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenCode settings</title>
+  <style>
+    :root { color-scheme: light dark; font: 15px/1.5 system-ui, sans-serif; --bg:#f5f6f8; --panel:#fff; --text:#20242b; --muted:#626b78; --line:#d9dee6; --accent:#365fc7; --danger:#a82929; }
+    @media (prefers-color-scheme: dark) { :root { --bg:#171a20; --panel:#20252d; --text:#edf0f5; --muted:#aab2bf; --line:#38414d; --accent:#9ab4ff; --danger:#ff9a9a; } }
+    * { box-sizing:border-box; }
+    body { margin:0; padding:clamp(16px,4vw,36px); background:var(--bg); color:var(--text); }
+    main { max-width:850px; margin:auto; }
+    h1 { margin:0 0 4px; font-size:1.7rem; }
+    h2 { margin:0 0 14px; font-size:1.15rem; }
+    p { margin:5px 0 14px; }
+    .muted, .hint { color:var(--muted); font-size:.9rem; }
+    .warning { padding:12px 14px; border-left:4px solid #c5891b; background:color-mix(in srgb, #c5891b 10%, var(--panel)); border-radius:4px; }
+    .card { margin-top:18px; padding:20px; border:1px solid var(--line); border-radius:12px; background:var(--panel); }
+    .statusline { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+    .badge { display:inline-block; padding:2px 9px; border:1px solid var(--line); border-radius:999px; font-size:.84rem; }
+    .badge.good { border-color:#43825a; color:#317347; }
+    @media (prefers-color-scheme:dark) { .badge.good { color:#a8e1b7; } }
+    form .grid, .row { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; align-items:end; }
+    .field { min-width:0; }
+    label, legend { display:block; margin:0 0 5px; font-weight:600; }
+    input:not([type=radio]), select { width:100%; min-height:40px; padding:8px 10px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--text); font:inherit; }
+    input[type=radio] { accent-color:var(--accent); }
+    button { min-height:38px; padding:7px 12px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--text); font:inherit; cursor:pointer; }
+    button.primary { border-color:var(--accent); background:var(--accent); color:#fff; }
+    button:disabled, input:disabled, select:disabled { opacity:.55; cursor:not-allowed; }
+    button:focus-visible, input:focus-visible, select:focus-visible { outline:3px solid color-mix(in srgb, var(--accent) 55%, transparent); outline-offset:2px; }
+    .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+    .choice { display:flex; align-items:flex-start; gap:8px; margin:9px 0; }
+    .choice label { margin:0; font-weight:400; }
+    #sessionList { list-style:none; margin:12px 0; padding:0; }
+    #sessionList li { padding:11px 0; border-top:1px solid var(--line); }
+    .session-top { display:flex; flex-wrap:wrap; justify-content:space-between; gap:8px; align-items:center; }
+    .session-title { overflow-wrap:anywhere; }
+    .session-meta { margin:3px 0 0; color:var(--muted); font-size:.86rem; overflow-wrap:anywhere; }
+    .selected { color:var(--accent); font-weight:600; }
+    [hidden] { display:none !important; }
+    #feedback { min-height:1.5em; margin:12px 0 0; }
+    #feedback.error { color:var(--danger); }
+    @media(max-width:600px) { .card { padding:16px; } form .grid, .row { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>OpenCode settings</h1>
+    <p class="muted">Configure the OpenCode server and choose where Pebble sends messages.</p>
+    <p class="warning"><strong>Important:</strong> Prompts may modify files or run commands through the configured agent. HTTP sends your password in cleartext; use HTTPS or a trusted encrypted network.</p>
+  </header>
+
+  <section class="card" aria-labelledby="connectionHeading">
+    <h2 id="connectionHeading">Server connection</h2>
+    <div class="statusline" aria-live="polite">
+      <span id="readyBadge" class="badge">Plugin not ready</span>
+      <span id="connectionBadge" class="badge">Disconnected</span>
+      <span id="versionText" class="muted"></span>
+    </div>
+    <p id="configuredText" class="muted">No saved connection.</p>
+    <details id="connectDetails">
+      <summary id="connectSummary">Connect and save server</summary>
+      <form id="connectForm" autocomplete="off">
+        <div class="grid">
+          <div class="field"><label for="serverUrl">Server URL</label><input id="serverUrl" type="url" required placeholder="https://opencode.example.com or http://192.168.1.10:4096"></div>
+          <div class="field"><label for="username">Username</label><input id="username" type="text" value="opencode" autocomplete="off" required></div>
+          <div class="field"><label for="password">Password</label><input id="password" type="password" required autocomplete="off"></div>
+        </div>
+        <p class="hint">Password is used for connection setup, stored securely by the plugin, and never returned to this page.</p>
+        <div class="actions"><button class="primary" id="connectButton" type="submit" disabled>Test and save connection</button></div>
+      </form>
+    </details>
+    <div class="actions">
+      <button id="testButton" type="button" disabled>Test saved connection</button>
+      <button id="disconnectButton" type="button" disabled>Disconnect</button>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="deliveryHeading">
+    <h2 id="deliveryHeading">Message destination</h2>
+    <fieldset id="modeOptions" disabled style="border:0;padding:0;margin:0">
+      <legend>For each message</legend>
+      <div class="choice"><input id="modeDefault" type="radio" name="mode" value="default_chat"><label for="modeDefault">Use the selected default session</label></div>
+      <div class="choice"><input id="modeNew" type="radio" name="mode" value="new_chat"><label for="modeNew">Start a new session</label></div>
+    </fieldset>
+    <p class="hint">New sessions require an absolute server directory. Directory selection is independent of message mode.</p>
+    <div class="row">
+      <div class="field"><label for="directory">Server directory</label><input id="directory" type="text" placeholder="/absolute/path" disabled></div>
+      <div class="actions"><button id="saveDirectory" type="button" disabled>Save directory</button><button id="loadProjects" type="button" disabled>Load projects</button></div>
+    </div>
+    <div class="field" style="margin-top:12px"><label for="projectSelect">Project directory</label><select id="projectSelect" disabled><option value="">Choose a loaded project…</option></select></div>
+  </section>
+
+  <section class="card" aria-labelledby="sessionsHeading">
+    <h2 id="sessionsHeading">Recent sessions</h2>
+    <p class="hint">Titles can repeat. Directory and default markers help distinguish sessions.</p>
+    <p id="defaultSessionText" class="muted">No default session selected.</p>
+    <div class="row">
+      <div class="field"><label for="searchSessions">Search loaded sessions</label><input id="searchSessions" type="search" placeholder="Search title, nickname, directory…" disabled></div>
+      <div class="actions"><button id="refreshSessions" type="button" disabled>Refresh</button><button id="loadMore" type="button" disabled>Load more</button></div>
+    </div>
+    <ul id="sessionList" aria-live="polite"></ul>
+    <p id="listStatus" class="muted" aria-live="polite">Connect to load sessions.</p>
+    <div class="field"><label for="nickname">Nickname for selected session</label><input id="nickname" type="text" maxlength="40" placeholder="Optional nickname" disabled></div>
+    <p class="hint">Up to 40 characters. Spoken targets can be ambiguous; choose distinct nicknames.</p>
+    <div class="actions"><button id="saveNickname" type="button" disabled>Save nickname</button><button id="clearNickname" type="button" disabled>Clear nickname</button><button id="useDefault" type="button" disabled>Use as default</button></div>
+  </section>
+  <p id="feedback" role="status" aria-live="polite"></p>
+</main>
+<script>
+(() => {
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const state = { ready:false, connected:false, configured:false, busy:false, mode:'default_chat', directory:'', selected:null, nicknames:{}, sessions:[], cursor:null, projects:[], version:'', url:'', username:'opencode' };
+  let editingSessionId=null;
+  const controls = ['connectButton','testButton','disconnectButton','modeOptions','directory','saveDirectory','loadProjects','projectSelect','searchSessions','refreshSessions','loadMore','nickname','saveNickname','clearNickname','useDefault'];
+  function feedback(message,error=false) { $('feedback').textContent=message||''; $('feedback').classList.toggle('error',error); $('feedback').setAttribute('role',error?'alert':'status'); }
+  function render() {
+    $('readyBadge').textContent=state.ready?'Plugin ready':'Plugin not ready'; $('readyBadge').classList.toggle('good',state.ready);
+    $('connectionBadge').textContent=state.connected?'Saved connection':'No saved connection'; $('connectionBadge').classList.toggle('good',state.connected);
+    $('versionText').textContent=state.connected&&state.version?`OpenCode ${state.version}`:'';
+    $('configuredText').textContent=state.configured?'Destination is ready.':state.connected?'Choose a default session or save a new-session directory.':'No verified saved connection.';
+    $('connectDetails').hidden=false;
+    for(const id of ['serverUrl','username','password']) $(id).disabled=!state.ready||state.busy;
+    $('modeDefault').checked=state.mode==='default_chat'; $('modeNew').checked=state.mode==='new_chat';
+    const selected=Boolean(editingSessionId);
+    for(const id of controls) $(id).disabled=!state.ready||state.busy||!state.connected;
+    $('connectButton').disabled=!state.ready||state.busy;
+    $('testButton').disabled=!state.ready||state.busy||!state.connected; $('disconnectButton').disabled=!state.ready||state.busy||!state.connected;
+    $('modeOptions').disabled=!state.ready||state.busy||!state.connected; $('directory').disabled=!state.ready||state.busy||!state.connected;
+    $('projectSelect').disabled=!state.ready||state.busy||!state.connected||!state.projects.length;
+    $('loadMore').disabled=!state.ready||state.busy||!state.connected||!state.cursor;
+    for(const id of ['nickname','saveNickname','clearNickname','useDefault']) $(id).disabled=!state.ready||state.busy||!state.connected||!selected;
+    renderProjects(); renderSessions();
+  }
+  function resetRemoteData(){
+    state.sessions=[];state.cursor=null;state.projects=[];editingSessionId=null;
+    $('nickname').value='';
+    $('listStatus').textContent=state.connected?'No sessions loaded.':'Connect to load sessions.';
+  }
+  function renderProjects(){
+    const select=$('projectSelect'),previous=select.value;
+    select.replaceChildren(new Option('Choose a loaded project...',''));
+    for(const project of state.projects)select.add(new Option(`${project.name} - ${project.directory}`,project.directory));
+    if(state.projects.some(project=>project.directory===previous))select.value=previous;
+  }
+  function renderSessions(){
+    const query=$('searchSessions').value.trim().toLocaleLowerCase(),list=$('sessionList');list.replaceChildren();
+    const matches=state.sessions.filter(s=>[s.title,state.nicknames[s.session_id],s.directory,s.url].some(v=>String(v||'').toLocaleLowerCase().includes(query)));
+    for(const session of matches){
+      const li=document.createElement('li'),top=document.createElement('div');top.className='session-top';
+      const title=document.createElement('span');title.className='session-title';title.textContent=session.title||'(untitled session)';if(editingSessionId===session.session_id)title.classList.add('selected');
+      const actions=document.createElement('div');actions.className='actions';
+      if(state.selected&&state.selected.session_id===session.session_id){const mark=document.createElement('span');mark.className='badge';mark.textContent='Default';actions.append(mark);}
+      const select=document.createElement('button');
+      const isSelected=editingSessionId===session.session_id;
+      select.type='button';
+      select.textContent=isSelected?'Selected':'Select';
+      select.setAttribute('aria-pressed',String(isSelected));
+      select.disabled=!state.ready||state.busy||!state.connected;
+      select.addEventListener('click',()=>{
+        editingSessionId=session.session_id;
+        $('nickname').value=state.nicknames[editingSessionId]||'';
+        render();
+      });
+      actions.append(select);top.append(title,actions);
+      const meta=document.createElement('p');meta.className='session-meta';meta.textContent=`${state.nicknames[session.session_id]?`Nickname: ${state.nicknames[session.session_id]}, `:''}${session.directory||'(no directory)'}`;li.append(top,meta);list.append(li);
+    }
+    if(!state.connected)$('listStatus').textContent=state.ready?'Connect to load sessions.':'Waiting for plugin readiness.';
+    else if(!state.sessions.length)$('listStatus').textContent='No sessions loaded. Use Refresh to load sessions.';
+    else $('listStatus').textContent=`Showing ${matches.length} of ${state.sessions.length} loaded sessions${state.cursor?', more available':''}.`;
+    const saved=state.selected&&state.selected.title?`Default session: ${state.selected.title}${state.selected.session_id&&!state.sessions.some(s=>s.session_id===state.selected.session_id)?' (not in loaded list)':''}`:'No default session selected.';
+    $('defaultSessionText').textContent=saved;
+  }
+  function applyStatus(data){
+    if(!data||typeof data.connected!=='boolean'||typeof data.configured!=='boolean'){
+      throw new Error('Invalid status response from plugin.');
+    }
+    state.connected=data.connected;state.configured=data.configured;state.version=data.version||'';state.url=data.url||'';state.username=data.username||'opencode';
+    state.mode=data.mode||'default_chat';state.directory=data.directory||'';state.selected=data.selected||null;state.nicknames=data.nicknames||{};
+    $('serverUrl').value=state.url||'';$('username').value=state.username||'opencode';$('directory').value=state.directory;$('nickname').value=editingSessionId?(state.nicknames[editingSessionId]||''):'';
+    if(!data.connected)$('connectDetails').open=true;
+    if(!data.connected)resetRemoteData();else if(!editingSessionId&&state.selected)editingSessionId=state.selected.session_id;
+    render();
+  }
+  async function send(message){
+    const reply=await Pebble.sendMessage('plugin',message);
+    if(reply&&reply.error)throw new Error(reply.error.message||'Plugin request failed.');
+    if(!reply||typeof reply!=='object')throw new Error('Invalid response from plugin.');
+    return reply;
+  }
+  async function run(action){
+    if(!state.ready||state.busy)return;
+    state.busy=true;render();feedback('Working...');
+    let completed=false;
+    try{await action();completed=true;}
+    catch(error){feedback(error&&error.message?error.message:'Request failed.',true);}
+    finally{
+      if(completed&&$('feedback').textContent==='Working...')feedback('');
+      state.busy=false;render();
+    }
+  }
+  async function loadSessions(append){
+    $('listStatus').textContent='Loading sessions...';
+    const result=await send({type:'list',cursor:append?state.cursor:null});
+    if(!Array.isArray(result.sessions))throw new Error('Invalid session list response.');
+    const retain=editingSessionId,all=append?state.sessions.slice():[];
+    const seen=new Set(all.map(session=>session.session_id));
+    for(const session of result.sessions){
+      if(!seen.has(session.session_id)){all.push(session);seen.add(session.session_id);}
+    }
+    state.sessions=all;state.cursor=result.next_cursor||null;
+    if(retain&&all.some(session=>session.session_id===retain))editingSessionId=retain;
+    else if(state.selected&&all.some(session=>session.session_id===state.selected.session_id))editingSessionId=state.selected.session_id;
+    else if(all.length)editingSessionId=all[0].session_id;
+    $('nickname').value=editingSessionId?(state.nicknames[editingSessionId]||''):'';
+    render();
+  }
+  $('connectForm').addEventListener('submit',event=>{
+    event.preventDefault();
+    if(!$('connectForm').reportValidity())return;
+    const payload={type:'connect',url:$('serverUrl').value.trim(),username:$('username').value.trim(),password:$('password').value};
+    $('password').value='';
+    run(async()=>{
+      const oldKey=`${state.url}\n${state.username}`,status=await send(payload);
+      if(!status.connected)throw new Error('Connection was not established.');
+      applyStatus(status);
+      if(oldKey!==`${state.url}\n${state.username}`)resetRemoteData();
+      $('connectDetails').open=false;
+      await loadSessions(false);
+      feedback('Connection saved.');
+    });
+  });
+  $('testButton').addEventListener('click',()=>run(async()=>{
+    const status=await send({type:'test'});
+    applyStatus(status);
+    feedback(status.version?`Connection test passed: OpenCode ${status.version}.`:'Connection test passed.');
+  }));
+  $('disconnectButton').addEventListener('click',()=>run(async()=>{
+    applyStatus(await send({type:'disconnect'}));
+    resetRemoteData();render();feedback('Connection disconnected.');
+  }));
+  function isAbsoluteDirectory(value){
+    return /^\/(?!\/)/.test(value)||/^[A-Za-z]:[\\/]/.test(value)||/^(\\\\|\/\/)[^\\/]+[\\/][^\\/]+/.test(value);
+  }
+  document.querySelectorAll('input[name="mode"]').forEach(input=>input.addEventListener('change',()=>{
+    if(input.checked)run(async()=>{
+      if(input.value==='new_chat'&&!isAbsoluteDirectory(state.directory)){
+        throw new Error('Save an absolute server directory before starting new sessions.');
+      }
+      applyStatus(await send({type:'mode',mode:input.value}));
+      feedback('Message mode saved.');
+    });
+  }));
+  $('saveDirectory').addEventListener('click',()=>{
+    const directory=$('directory').value.trim();
+    run(async()=>{
+      if(!isAbsoluteDirectory(directory))throw new Error('Enter an absolute server directory.');
+      applyStatus(await send({type:'directory',directory}));
+      $('directory').value=directory;feedback('Directory saved.');
+    });
+  });
+  $('loadProjects').addEventListener('click',()=>run(async()=>{
+    const result=await send({type:'projects'});
+    if(!Array.isArray(result.projects))throw new Error('Invalid projects response.');
+    state.projects=result.projects;render();feedback('Projects loaded.');
+  }));
+  $('projectSelect').addEventListener('change',event=>{
+    if(event.target.value)$('directory').value=event.target.value;
+  });
+  $('searchSessions').addEventListener('input',renderSessions);
+  $('refreshSessions').addEventListener('click',()=>run(()=>loadSessions(false)));
+  $('loadMore').addEventListener('click',()=>run(()=>loadSessions(true)));
+  $('saveNickname').addEventListener('click',()=>{
+    const session_id=editingSessionId,value=$('nickname').value.trim();
+    run(async()=>{
+      if(value.length>40)throw new Error('Nickname must be 40 characters or fewer.');
+      applyStatus(await send({type:'save_session',session_id,nickname:value}));
+      $('nickname').value=state.nicknames[session_id]||'';feedback('Nickname saved.');
+    });
+  });
+  $('clearNickname').addEventListener('click',()=>{
+    const session_id=editingSessionId;
+    run(async()=>{
+      applyStatus(await send({type:'save_session',session_id,nickname:''}));
+      $('nickname').value='';feedback('Nickname cleared.');
+    });
+  });
+  $('useDefault').addEventListener('click',()=>{
+    const session_id=editingSessionId;
+    run(async()=>{
+      applyStatus(await send({type:'select',session_id}));
+      feedback('Default session saved.');
+    });
+  });
+  function onReady(event){
+    if(event.target!=='plugin'||state.ready)return;
+    state.ready=true;render();
+    run(async()=>{
+      applyStatus(await send({type:'status'}));
+      if(state.connected)await loadSessions(false);
+    });
+  }
+  Pebble.addEventListener('ready',onReady);render();
+})();
+</script>
+</body>
+</html>

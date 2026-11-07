@@ -1,0 +1,100 @@
+{
+  "name": "pebble-opencode",
+  "author": "OpenCode for Pebble contributors",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "build": "python3 scripts/build.py"
+  },
+  "pebble": {
+    "displayName": "OpenCode",
+    "uuid": "4e2c758f-8a31-4bf2-a6d9-7c40ec9b5173",
+    "manifestVersion": 2,
+    "sdkVersion": "3",
+    "usesPermissions": [
+      "Internet",
+      "LocalNetwork"
+    ],
+    "plugin": {
+      "description": "Send messages to OpenCode sessions through its authenticated JSON API. Choose an existing session or a new session in a directory. Returns a queued receipt, not a generated reply.",
+      "script": "src/plugin/index.js",
+      "sources": [
+        {
+          "category": "agent",
+          "items": [
+            "chats"
+          ],
+          "properties": {
+            "name": [
+              "shortText"
+            ],
+            "title": [
+              "shortText"
+            ],
+            "url": [
+              "longText"
+            ]
+          },
+          "supportsMultiple": true,
+          "callerPermissions": [],
+          "suggestedRefreshIntervalSec": 900
+        },
+        {
+          "category": "agent",
+          "items": [
+            "configured"
+          ],
+          "properties": {
+            "name": [
+              "shortText"
+            ],
+            "configured": [
+              "boolean",
+              "shortText"
+            ]
+          },
+          "supportsMultiple": false,
+          "callerPermissions": [],
+          "suggestedRefreshIntervalSec": 60
+        }
+      ],
+      "actions": [
+        {
+          "name": "send_to_agent",
+          "description": "Send a message to an existing OpenCode session or start a new session in a directory. chat_id may identify a session by its ID, nickname, or unambiguous title; use \"new\" to start a session in the configured directory. Omit chat_id to follow settings: use the configured default session or start a new one. Returns a queued receipt, not OpenCode's reply. Do not automatically retry uncertain delivery or conflicts.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 16000,
+                "description": "Message to send to OpenCode."
+              },
+              "chat_id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Session ID, nickname, or unambiguous title. Use \"new\" to start a session in the configured directory; omit to follow settings."
+              }
+            },
+            "required": [
+              "message"
+            ],
+            "additionalProperties": false
+          },
+          "targets": [
+            "agent/chats"
+          ],
+          "destructive": false,
+          "requiresConfirmation": false,
+          "callerPermissions": []
+        }
+      ]
+    },
+    "configPage": "src/config.html",
+    "projectType": "plugin"
+  }
+}
