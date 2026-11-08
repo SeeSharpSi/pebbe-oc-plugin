@@ -101,7 +101,7 @@
   function emptyState() {
     return {
       url: '', username: DEFAULT_USERNAME, password: '', version: '', mode: 'default_chat',
-      directory: '', selected: null, nicknames: {}
+      directory: '', selected: null, lastSessionID: null, nicknames: {}
     };
   }
 
@@ -138,7 +138,7 @@
 
     function refresh() {
       if (root.Pebble && typeof root.Pebble.refreshSources === 'function') {
-        try { root.Pebble.refreshSources(['agent/chats', 'agent/configured', 'opencode/active_session', 'opencode/activity']); } catch (_) {}
+        try { root.Pebble.refreshSources(['agent/chats', 'agent/configured', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/question', 'opencode/job']); } catch (_) {}
       }
     }
 
@@ -162,7 +162,7 @@
       }
     }
 
-    async function request(state, path, method, body) {
+    async function request(state, path, method, body, expectedStatus) {
       if (!state.url || !state.username || !state.password) {
         throw makeError('AUTH_REQUIRED', 'Connect to an OpenCode V2 server first.');
       }
@@ -186,12 +186,15 @@
           (response.status >= 500 ? 'OpenCode is unavailable.' : 'OpenCode request was rejected.');
         throw makeError(code, message, response.status);
       }
+      if (expectedStatus !== undefined && response.status !== expectedStatus) {
+        throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned an unexpected success status.');
+      }
       if (response.status === 204) return null;
       try { return await response.json(); }
       catch (_) { throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid JSON.'); }
     }
 
-    function api(state, path, method, body) { return request(state, '/api' + path, method, body); }
+    function api(state, path, method, body, expectedStatus) { return request(state, '/api' + path, method, body, expectedStatus); }
     function sessionID(id) { return typeof id === 'string' && /^ses[A-Za-z0-9_-]{1,160}$/.test(id); }
     function sessionPath(id) { return '/session/' + encodeURIComponent(id); }
     function titleOf(session) { return typeof session.title === 'string' && session.title ? session.title : 'Untitled session'; }
@@ -491,6 +494,206 @@
       return { instanceId: session.id, properties: properties };
     }
 
+    function nonemptyID(value, max) {
+      return typeof value === 'string' && value.length > 0 && value.length <= (max || 200) && !/[\u0000-\u001f\u007f]/.test(value);
+    }
+
+    function replyInstances(state, id) {
+      return getSession(state, id).then(async function (session) {
+        var response = await api(state, sessionPath(id) + '/message?type=assistant&order=desc&limit=20');
+        if (!response || !Array.isArray(response.data) || response.data.length > 20 || !response.cursor || typeof response.cursor !== 'object') {
+          throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid assistant messages.');
+        }
+        var chosen = null;
+        var chosenText = '';
+        response.data.forEach(function (message) {
+          if (!message || message.type !== 'assistant' || !nonemptyID(message.id, 200) ||
+              (message.sessionID !== undefined && message.sessionID !== id) || !message.time || typeof message.time !== 'object' ||
+              typeof message.time.created !== 'number' || !Number.isFinite(message.time.created) || message.time.created < 0 ||
+              (message.time.completed !== undefined && (typeof message.time.completed !== 'number' || !Number.isFinite(message.time.completed) || message.time.completed < 0)) ||
+              !Array.isArray(message.content)) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid assistant messages.');
+          var text = '';
+          message.content.forEach(function (part) {
+            if (!isPlainObject(part) || ['text', 'reasoning', 'tool'].indexOf(part.type) === -1) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid assistant messages.');
+            if (part.type === 'text') {
+              if (typeof part.text !== 'string') throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid assistant messages.');
+              text += part.text;
+            }
+          });
+          if (!chosen && text) { chosen = message; chosenText = text; }
+        });
+        if (!chosen) return [];
+        var title = state.nicknames[id] || (state.selected && state.selected.session_id === id && state.selected.title) || titleOf(session);
+        var failed = !!chosen.error || chosen.finish === 'error';
+        var complete = typeof chosen.time.completed === 'number';
+        var updated = complete ? chosen.time.completed : chosen.time.created;
+        return [{ instanceId: id, properties: {
+          name: { shortText: { text: unicodePrefix(title, 7) }, longText: { text: title } },
+          session_id: { longText: { text: id } }, message_id: { longText: { text: chosen.id } },
+          text: { shortText: { text: unicodePrefix(chosenText, 7) }, longText: { text: unicodePrefix(chosenText, 4096) } },
+          updated: { timestamp: { value: Math.floor(updated / 1000) } },
+          complete: { boolean: { value: complete } },
+          status: { shortText: { text: failed ? 'Error' : complete ? 'Done' : 'Writing' }, longText: { text: failed ? 'Error' : complete ? 'Done' : 'Writing' } },
+          url: { longText: { text: sessionURL(state.url, id) } }
+        }}];
+      });
+    }
+
+    async function jobInstances(state) {
+      var response;
+      try { response = await api(state, '/experimental/job'); }
+      catch (err) {
+        if (err && (err.httpStatus === 404 || err.httpStatus === 405)) throw makeError('PLUGIN_UNAVAILABLE', 'Background jobs are not supported by this OpenCode server.');
+        throw err;
+      }
+      if (!response || !Array.isArray(response.data) || response.data.length > 200) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid background jobs.');
+      var seen = Object.create(null);
+      var jobs = response.data.map(function (job) {
+        if (!job || ['shell', 'subagent', 'image'].indexOf(job.kind) === -1 || !nonemptyID(job.id, 200) ||
+            !sessionID(job.sessionID) || ['running', 'completed', 'error', 'cancelled'].indexOf(job.status) === -1 ||
+            !job.time || typeof job.time.started !== 'number' || !Number.isFinite(job.time.started) || job.time.started < 0 ||
+            (job.title !== undefined && typeof job.title !== 'string') ||
+            (job.kind === 'subagent' && job.childSessionID !== undefined && !sessionID(job.childSessionID))) {
+          throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid background jobs.');
+        }
+        var key = job.kind + ':' + job.id;
+        if (seen[key]) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned duplicate background jobs.');
+        seen[key] = true;
+        return job;
+      });
+      jobs.sort(function (a, b) { return a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0; });
+      return jobs.map(function (job) {
+        var title = typeof job.title === 'string' && job.title ? job.title : job.kind + ' job';
+        var props = {
+          name: { shortText: { text: unicodePrefix(title, 7) }, longText: { text: title } },
+          job_id: { longText: { text: job.id } }, session_id: { longText: { text: job.sessionID } },
+          kind: { shortText: { text: unicodePrefix(job.kind, 7) } }, status: { shortText: { text: unicodePrefix(job.status, 7) }, longText: { text: job.status } },
+          started: { timestamp: { value: Math.floor(job.time.started / 1000) } },
+          url: { longText: { text: sessionURL(state.url, job.sessionID) } }
+        };
+        if (job.kind === 'subagent' && sessionID(job.childSessionID)) props.child_session_id = { longText: { text: job.childSessionID } };
+        return { instanceId: job.kind + ':' + job.id, properties: props };
+      });
+    }
+
+    function validForm(form, id) {
+      if (!isPlainObject(form) || !nonemptyID(form.id) || form.sessionID !== id || typeof form.title !== 'string' ||
+          !Array.isArray(form.fields) || form.fields.length < 1 || form.fields.length > 50) {
+        throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid question data.');
+      }
+      var keys = Object.create(null);
+      var external = false;
+      var hiddenRequired = false;
+      function invalidFields() { throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid question fields.'); }
+      function integerBound(value) { return Number.isInteger(value) && value >= 0; }
+      function numericBound(value) {
+        return typeof value === 'number' && Number.isFinite(value) || value === 'Infinity' || value === '-Infinity';
+      }
+      function numericValue(value) {
+        return typeof value === 'number' && Number.isFinite(value) || value === 'Infinity' || value === '-Infinity';
+      }
+      function boundNumber(value) { return value === 'Infinity' ? Infinity : value === '-Infinity' ? -Infinity : value; }
+      form.fields.forEach(function (field) {
+        if (!isPlainObject(field) || !nonemptyID(field.key) || ['__proto__', 'prototype', 'constructor'].indexOf(field.key) !== -1 || keys[field.key] ||
+            ['string', 'number', 'integer', 'boolean', 'multiselect', 'external'].indexOf(field.type) === -1 ||
+            (field.required !== undefined && typeof field.required !== 'boolean') || (field.hidden !== undefined && typeof field.hidden !== 'boolean') ||
+            (field.custom !== undefined && typeof field.custom !== 'boolean') ||
+            (field.title !== undefined && typeof field.title !== 'string') || (field.description !== undefined && typeof field.description !== 'string')) invalidFields();
+        keys[field.key] = true;
+        if (field.type === 'external') {
+          external = true;
+          if (typeof field.url !== 'string' || !field.url) invalidFields();
+        }
+        if (field.hidden && field.required) hiddenRequired = true;
+        if (field.options !== undefined) {
+          if (!Array.isArray(field.options)) invalidFields();
+          var optionValues = Object.create(null);
+          field.options.forEach(function (option) {
+            if (!isPlainObject(option) || typeof option.value !== 'string' || typeof option.label !== 'string' || optionValues[option.value]) invalidFields();
+            optionValues[option.value] = true;
+          });
+        }
+        if (field.type === 'multiselect' && !Array.isArray(field.options)) invalidFields();
+        if (field.when !== undefined) {
+          if (!Array.isArray(field.when)) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid question conditions.');
+          field.when.forEach(function (when) {
+            if (!isPlainObject(when) || !nonemptyID(when.key) || ['__proto__', 'prototype', 'constructor'].indexOf(when.key) !== -1 ||
+                ['eq', 'neq'].indexOf(when.op) === -1 ||
+                !(typeof when.value === 'string' || typeof when.value === 'number' && Number.isFinite(when.value) || typeof when.value === 'boolean')) {
+              throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid question conditions.');
+            }
+          });
+        }
+        if (field.type === 'string') {
+          if ((field.minLength !== undefined && !integerBound(field.minLength)) || (field.maxLength !== undefined && !integerBound(field.maxLength)) ||
+              (field.minLength !== undefined && field.maxLength !== undefined && field.minLength > field.maxLength) ||
+              (field.default !== undefined && typeof field.default !== 'string')) invalidFields();
+        } else if (field.type === 'number' || field.type === 'integer') {
+          if ((field.minimum !== undefined && !numericBound(field.minimum)) || (field.maximum !== undefined && !numericBound(field.maximum)) ||
+              (field.minimum !== undefined && field.maximum !== undefined && boundNumber(field.minimum) > boundNumber(field.maximum)) ||
+              (field.default !== undefined && !numericValue(field.default))) invalidFields();
+        } else if (field.type === 'boolean') {
+          if (field.default !== undefined && typeof field.default !== 'boolean') invalidFields();
+        } else if (field.type === 'multiselect') {
+          if ((field.minItems !== undefined && !integerBound(field.minItems)) || (field.maxItems !== undefined && !integerBound(field.maxItems)) ||
+              (field.minItems !== undefined && field.maxItems !== undefined && field.minItems > field.maxItems) ||
+              (field.default !== undefined && (!Array.isArray(field.default) || !field.default.every(function (value) { return typeof value === 'string'; })))) invalidFields();
+        } else if (field.default !== undefined) invalidFields();
+      });
+      form.fields.forEach(function (field) {
+        if (field.when && field.when.some(function (when) { return !keys[when.key]; })) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid question conditions.');
+      });
+      return { form: form, external: external, hiddenRequired: hiddenRequired };
+    }
+
+    async function questionInstances(state) {
+      var response = await api(state, '/session/active');
+      var active = response && response.data;
+      if (!isPlainObject(active) || Object.keys(active).length > 100) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid active session data.');
+      var ids = Object.keys(active);
+      ids.forEach(function (id) {
+        if (!sessionID(id) || !isPlainObject(active[id]) || active[id].type !== 'running') throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid active session data.');
+      });
+      var focus = state.mode === 'default_chat' && state.selected && sessionID(state.selected.session_id) ? state.selected.session_id : state.lastSessionID;
+      if (sessionID(focus) && ids.indexOf(focus) === -1) ids.push(focus);
+      var limit = createLimiter(4);
+      var total = 0;
+      var result;
+      try {
+        result = await Promise.all(ids.map(function (id) {
+          return limit(async function () {
+            var formsResponse = await api(state, sessionPath(id) + '/form');
+            if (!formsResponse || !Array.isArray(formsResponse.data)) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid question data.');
+            total += formsResponse.data.length;
+            if (total > 200) throw makeError('PLUGIN_UNAVAILABLE', 'Too many questions to inspect safely.');
+            return formsResponse.data.map(function (form) { return validForm(form, id); });
+          });
+        }));
+      } catch (err) { limit.stop(err); throw err; }
+      var forms = [];
+      var formIDs = Object.create(null);
+      result.forEach(function (list) {
+        list.forEach(function (item) {
+          var key = item.form.sessionID + '\u0000' + item.form.id;
+          if (formIDs[key]) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned duplicate questions.');
+          formIDs[key] = true;
+          forms.push(item);
+        });
+      });
+      forms.sort(function (a, b) { return a.form.sessionID < b.form.sessionID ? -1 : a.form.sessionID > b.form.sessionID ? 1 : a.form.id < b.form.id ? -1 : a.form.id > b.form.id ? 1 : 0; });
+      return forms.map(function (item) {
+        var f = item.form;
+        var fields = JSON.stringify(f.fields);
+        if (fields.length > 16000) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode question fields exceed safe display size.');
+        return { instanceId: f.sessionID + ':' + f.id, properties: {
+          name: { shortText: { text: unicodePrefix(f.title, 7) }, longText: { text: f.title } },
+          session_id: { longText: { text: f.sessionID } }, form_id: { longText: { text: f.id } },
+          question: { longText: { text: f.title } }, fields: { longText: { text: fields } },
+          answerable: { boolean: { value: !item.external && !item.hiddenRequired } }, url: { longText: { text: sessionURL(state.url, f.sessionID) } }
+        }};
+      });
+    }
+
     function activityInstance(checkedAt, connected, snapshot, failure) {
       var properties = {
         name: { shortText: { text: 'OpenCode' }, longText: { text: 'OpenCode' } },
@@ -539,6 +742,7 @@
         if (state.url !== url || state.username !== username) {
           candidate.directory = '';
           candidate.selected = null;
+          candidate.lastSessionID = null;
           candidate.nicknames = {};
           candidate.mode = 'default_chat';
         }
@@ -699,6 +903,20 @@
           instances: [activityInstance(checkedAt, connected, null, summary)]
         };
       }
+      if (input.category === 'opencode' && input.item === 'reply') {
+        requireConnection(state);
+        var replyID = state.mode === 'default_chat' && state.selected && sessionID(state.selected.session_id) ? state.selected.session_id :
+          (sessionID(state.lastSessionID) ? state.lastSessionID : null);
+        return { validUntilMs: now() + 20000, instances: replyID ? await replyInstances(state, replyID) : [] };
+      }
+      if (input.category === 'opencode' && input.item === 'job') {
+        requireConnection(state);
+        return { validUntilMs: now() + 20000, instances: await jobInstances(state) };
+      }
+      if (input.category === 'opencode' && input.item === 'question') {
+        requireConnection(state);
+        return { validUntilMs: now() + 20000, instances: await questionInstances(state) };
+      }
       throw makeError('INVALID_REQUEST', 'Unsupported source request.');
     }
 
@@ -741,7 +959,125 @@
       return false;
     }
 
+    var refreshedActions = ['agent/chats', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/question', 'opencode/job'];
+
+    async function interruptAction(state, args) {
+      if (!isPlainObject(args) || Object.keys(args).length !== 1 || !sessionID(args.session_id)) throw makeError('INVALID_ARGS', 'Invalid session ID.');
+      var session = await getSession(state, args.session_id);
+      if (archived(session)) throw makeError('INVALID_ARGS', 'Archived sessions cannot be interrupted.');
+      var response;
+      try { response = await api(state, sessionPath(session.id) + '/interrupt?resume=false', 'POST'); }
+      catch (err) {
+        if (err && (err.code === 'PERMISSION_DENIED' || err.code === 'AUTH_REQUIRED' || err.code === 'RATE_LIMITED')) throw err;
+        if (err && err.httpStatus && err.httpStatus < 500) throw err;
+        throw makeError('PLUGIN_UNAVAILABLE', 'Interrupt outcome uncertain. Inspect OpenCode before retrying.');
+      }
+      if (!response || typeof response.interrupted !== 'boolean') throw makeError('PLUGIN_UNAVAILABLE', 'Interrupt outcome uncertain. Inspect OpenCode before retrying.');
+      return { text: response.interrupted ? 'Interrupted OpenCode session: ' + titleOf(session) : 'OpenCode session is already idle: ' + titleOf(session), refreshed: refreshedActions };
+    }
+
+    function answerValue(value) {
+      return typeof value === 'string' || typeof value === 'boolean' || typeof value === 'number' && Number.isFinite(value) ||
+        Array.isArray(value) && value.every(function (entry) { return typeof entry === 'string'; });
+    }
+
+    function validateAnswerShape(answer) {
+      if (!isPlainObject(answer) || Object.keys(answer).length > 50) throw makeError('INVALID_ARGS', 'Answer must be an object with at most 50 fields.');
+      Object.keys(answer).forEach(function (key) {
+        if (!nonemptyID(key) || ['__proto__', 'prototype', 'constructor'].indexOf(key) !== -1 || !answerValue(answer[key])) {
+          throw makeError('INVALID_ARGS', 'Answer contains an invalid field.');
+        }
+      });
+      var serialized;
+      try { serialized = JSON.stringify(answer); } catch (_) { throw makeError('INVALID_ARGS', 'Answer is invalid.'); }
+      if (!serialized || serialized.length > 16000) throw makeError('INVALID_ARGS', 'Answer exceeds safe size.');
+    }
+
+    function validateAnswer(form, answer) {
+      validateAnswerShape(answer);
+      var fields = Object.create(null);
+      form.fields.forEach(function (field) { fields[field.key] = field; });
+      Object.keys(answer).forEach(function (key) {
+        if (!nonemptyID(key) || ['__proto__', 'prototype', 'constructor'].indexOf(key) !== -1 ||
+            !Object.prototype.hasOwnProperty.call(fields, key) || !answerValue(answer[key])) throw makeError('INVALID_ARGS', 'Answer contains an invalid field.');
+        var field = fields[key];
+        if (field.hidden || field.type === 'external') throw makeError('INVALID_ARGS', 'Answer contains a hidden or unsupported field.');
+      });
+      function condition(field, values) {
+        if (!field.when) return true;
+        return field.when.every(function (when) {
+          if (!Object.prototype.hasOwnProperty.call(fields, when.key)) throw makeError('INVALID_ARGS', 'Question has unsupported conditions.');
+          var actual = Object.prototype.hasOwnProperty.call(values, when.key) ? values[when.key] : undefined;
+          if (actual === undefined) return false;
+          var equal = JSON.stringify(actual) === JSON.stringify(when.value);
+          return when.op === 'eq' ? equal : when.op === 'neq' ? !equal : false;
+        });
+      }
+      form.fields.forEach(function (field) {
+        var supplied = Object.prototype.hasOwnProperty.call(answer, field.key);
+        if (supplied && !condition(field, answer)) throw makeError('INVALID_ARGS', 'Answer contains an inactive field.');
+        if (!supplied && !field.hidden && condition(field, answer) && field.required) throw makeError('INVALID_ARGS', 'Answer is missing a required field.');
+        if (!supplied) return;
+        var value = answer[field.key];
+        // Format and pattern remain server-validated; avoid running unbounded regexes locally.
+        if (field.type === 'string' && (typeof value !== 'string' || field.minLength !== undefined && value.length < field.minLength || field.maxLength !== undefined && value.length > field.maxLength)) {
+          throw makeError('INVALID_ARGS', 'Answer does not match question fields.');
+        }
+        if ((field.type === 'number' || field.type === 'integer') && (typeof value !== 'number' || !Number.isFinite(value) || field.type === 'integer' && !Number.isInteger(value) ||
+            field.minimum !== undefined && value < Number(field.minimum) || field.maximum !== undefined && value > Number(field.maximum))) throw makeError('INVALID_ARGS', 'Answer does not match question fields.');
+        if (field.type === 'boolean' && typeof value !== 'boolean') throw makeError('INVALID_ARGS', 'Answer does not match question fields.');
+        if (field.type === 'multiselect') {
+          if (!Array.isArray(value) || !value.every(function (v) { return typeof v === 'string'; }) || new Set(value).size !== value.length ||
+              field.minItems !== undefined && value.length < field.minItems || field.maxItems !== undefined && value.length > field.maxItems) throw makeError('INVALID_ARGS', 'Answer does not match question fields.');
+        }
+        var options = field.options;
+        if (options && field.custom !== true) {
+          var allowed = options.map(function (option) { return option.value; });
+          var choices = Array.isArray(value) ? value : [value];
+          choices.forEach(function (choice) { if (allowed.indexOf(choice) === -1) throw makeError('INVALID_ARGS', 'Answer does not match question options.'); });
+        }
+      });
+    }
+
+    async function answerAction(state, args) {
+      if (!isPlainObject(args) || Object.keys(args).length !== 3 || !sessionID(args.session_id) || !nonemptyID(args.form_id) || !isPlainObject(args.answer)) {
+        throw makeError('INVALID_ARGS', 'Invalid question answer.');
+      }
+      validateAnswerShape(args.answer);
+      var response;
+      try { response = await api(state, sessionPath(args.session_id) + '/form/' + encodeURIComponent(args.form_id)); }
+      catch (err) {
+        if (err && err.httpStatus === 404) throw makeError('INVALID_ARGS', 'Question not found.');
+        throw err;
+      }
+      var checked = validForm(response && response.data, args.session_id);
+      var detail = checked.form;
+      if (detail.id !== args.form_id) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned a different question.');
+      var formStatus = isPlainObject(detail.state) ? detail.state.status : null;
+      if (['pending', 'answered', 'cancelled'].indexOf(formStatus) === -1) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid question state.');
+      if (formStatus !== 'pending') throw makeError('INVALID_ARGS', 'Question already settled. Refresh before answering.');
+      if (checked.external) throw makeError('INVALID_ARGS', 'This question requires external interaction and cannot be answered here.');
+      if (checked.hiddenRequired) throw makeError('INVALID_ARGS', 'This question requires a hidden field; answer it in OpenCode desktop.');
+      validateAnswer(detail, args.answer);
+      try { await api(state, sessionPath(args.session_id) + '/form/' + encodeURIComponent(args.form_id) + '/reply', 'POST', { answer: args.answer }, 204); }
+      catch (err) {
+        if (err && err.httpStatus === 400) throw makeError('INVALID_ARGS', 'OpenCode rejected the answer. Refresh the question and check its fields.');
+        if (err && err.httpStatus === 409) throw makeError('INVALID_ARGS', 'Question already settled. Refresh before answering.');
+        if (err && err.httpStatus === 404) throw makeError('INVALID_ARGS', 'Question not found.');
+        if (err && (err.code === 'PERMISSION_DENIED' || err.code === 'AUTH_REQUIRED' || err.code === 'RATE_LIMITED')) throw err;
+        if (err && err.httpStatus && err.httpStatus < 500) throw err;
+        throw makeError('PLUGIN_UNAVAILABLE', 'Answer outcome uncertain. Inspect OpenCode before retrying.');
+      }
+      return { text: 'Answer submitted to OpenCode.', refreshed: refreshedActions };
+    }
+
     async function action(input) {
+      if (input && (input.action === 'interrupt_session' || input.action === 'answer_question')) {
+        if (!input.args || typeof input.args !== 'object' || Array.isArray(input.args)) throw makeError('INVALID_ARGS', 'Invalid action request.');
+        var controlState = await load();
+        requireConnection(controlState);
+        return input.action === 'interrupt_session' ? interruptAction(controlState, input.args) : answerAction(controlState, input.args);
+      }
       if (!input || typeof input !== 'object' || input.action !== 'send_to_agent' ||
           !input.args || typeof input.args !== 'object' || Array.isArray(input.args)) {
         throw makeError('INVALID_ARGS', 'Invalid action request.');
@@ -826,9 +1162,19 @@
         }
         deliveryVerified = true;
       }
+      var focusWarning = false;
+      try {
+        var freshState = await load();
+        if (freshState.url !== state.url || freshState.username !== state.username || !freshState.password || !/^2\./.test(freshState.version)) {
+          focusWarning = true;
+        } else {
+          freshState.lastSessionID = session.id;
+          await save(freshState);
+        }
+      } catch (_) { focusWarning = true; }
       return {
-        text: 'Message submitted to OpenCode: ' + titleOf(session),
-        refreshed: ['agent/chats', 'opencode/active_session', 'opencode/activity']
+        text: 'Message submitted to OpenCode: ' + titleOf(session) + (focusWarning ? ' Focus not saved.' : ''),
+        refreshed: refreshedActions
       };
     }
 

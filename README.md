@@ -1,6 +1,6 @@
 # OpenCode for Pebble
 
-Unofficial Pebble integration for sending messages to an authenticated OpenCode V2 server; not an official OpenCode release. It exposes reusable phone-side sources and one send action; it includes no watch binary or standalone watch UI. A successful send returns a queued receipt, not the generated reply.
+Unofficial Pebble integration for an authenticated OpenCode V2 server; not an official OpenCode release. It exposes reusable phone-side sources and actions; it includes no watch binary or standalone watch UI. A successful send returns a queued receipt, not the generated reply.
 
 ## Phone plugin interface
 
@@ -13,12 +13,15 @@ Sources match the structure and refresh behavior of the [official Claude plugin 
 
 When server credentials are saved and a valid creation directory is configured, `agent/chats` also includes one virtual target: `instanceId: new`, `name: New`, `title: New session`, with no URL. Real chat entries remain root, unarchived chats. The settings recent-session list contains real sessions only. Reading or polling the source never creates a session.
 
-Two OpenCode sources expose live activity:
+OpenCode sources expose activity, replies, questions, and jobs:
 
 | Source | Items and properties | Multiple | Refresh |
 | --- | --- | --- | ---: |
 | `opencode/active_session` | `name: shortText, longText`; `title: longText`; `status: shortText, longText`; `directory: longText`; `agent: longText`; `model: longText`; `updated: timestamp`; `url: longText`; `is_subagent: boolean` | Yes | 20 sec |
 | `opencode/activity` | `name: shortText, longText`; `active_count: numericValue, shortText`; `attention_count: numericValue, shortText`; `summary: shortText, longText`; `connected: boolean`; `checked_at: timestamp` | No | 20 sec |
+| `opencode/reply` | `name: shortText, longText`; `session_id: longText`; `message_id: longText`; `text: shortText, longText`; `updated: timestamp`; `complete: boolean`; `status: shortText, longText`; `url: longText` | No | 20 sec |
+| `opencode/question` | `name: shortText, longText`; `session_id: longText`; `form_id: longText`; `question: longText`; `fields: longText`; `answerable: boolean`; `url: longText` | Yes | 20 sec |
+| `opencode/job` | `name: shortText, longText`; `job_id: longText`; `session_id: longText`; `kind: shortText`; `status: shortText, longText`; `started: timestamp`; `url: longText`; `child_session_id: longText` | Yes | 20 sec |
 
 Phone-side PebbleKitJS watchface or app consumers can subscribe to a plugin source with `Pebble.subscribeToSource`. Its single options object includes plugin UUID, category, item, and callbacks. The numeric count may be absent when a scan is incomplete:
 
@@ -42,13 +45,25 @@ Active sessions represent foreground execution owned by the configured OpenCode 
 
 A successful empty lookup returns `active_session: []` and one `activity` instance with `connected: true`, both counts `0`, and summary `No active sessions`. Missing configuration, or a failed or invalid active-map lookup, returns `connected: false` with both counts omitted. If the active map validates but follow-up detail, permission/form data, or grouping fails, `connected` remains `true`, summary is `unavailable`, and both counts are omitted. Neither failure case reports zero. `checked_at` records the latest attempt. Consumers must check that counts exist even when connected. An incomplete active-session lookup rejects the `active_session` source rather than returning a fake empty list.
 
-Each subscription poll performs a fresh bounded scan; there is no persistent cache or background daemon. Limits are 100 active IDs, 200 metadata lookups, 32 parent hops, and 4 concurrent HTTP requests. Limit or cycle failures produce unavailable data, not truncated results. Activity sources use read-only GETs and need only saved server credentials; no default messaging session is required. No approval controls or additional actions are provided.
+Each subscription poll performs a fresh bounded scan; there is no persistent cache or background daemon. Limits are 100 active IDs, 200 metadata lookups, 32 parent hops, and 4 concurrent HTTP requests. Limit or cycle failures produce unavailable data, not truncated results. Activity sources use read-only GETs and need only saved server credentials; no default messaging session is required.
 
-The only action is `send_to_agent`, targeting `agent/chats`. It requires `message` (1–16000 characters) and accepts optional nullable `chat_id`. Omit `chat_id` to follow configured mode: use the default session in existing mode or create a session in new mode. Use reserved `chat_id: "new"` to explicitly create a session in the configured directory, including when existing mode is selected. Creation starts a fresh session and sends the first message; follow-up messages target its real session ID. Each `new` send creates another session. An explicit `chat_id` overrides omitted-ID default-mode routing. Existing sessions can be targeted by ID, nickname, or title. Set distinct nicknames in settings; ambiguous titles fail.
+The send action refreshes the original three sources plus `opencode/reply`, `opencode/question`, and `opencode/job`. Configuration changes refresh all seven sources, including `agent/configured`.
+
+`opencode/reply` reads the configured default session, or falls back to the last successfully sent session in existing mode. New-session mode reads its last sent session. The last session ID is securely persisted and reset when the server URL or username changes. With no focus, source is empty. It scans only the 20 newest assistant messages, extracts text parts only (not reasoning or tool payloads), and selects newest text-bearing message, including streaming or errored messages. Text is limited to 4096 Unicode characters. OpenCode millisecond timestamps become Pebble epoch-second timestamps. `status` reflects completion state; this is polling, not SSE.
+
+`opencode/question` scans at most 100 active IDs plus the focused session, with at most 4 concurrent form requests. It returns at most 200 forms total, with at most 50 fields per form and 16000 schema characters. Idle forms in unfocused sessions are excluded. `fields` contains schema JSON and original form/field IDs are preserved. External questions are exposed as unanswerable. Polling never answers or POSTs. Reading source may expose model reply text and question titles on the watch; consider this when enabling source subscriptions.
+
+`answer_question` takes an explicit `session_id`, `form_id`, and typed `answer` record. Required fields need explicit values even when they have defaults; defaults are UI hints, not server answers. Conditions use only explicitly supplied answers, without merging defaults. Do not autofill defaults or hidden fields; supplied hidden or inactive fields are rejected. Forms containing required hidden fields are desktop-only and exposed as unanswerable, even when conditional. The plugin validates field IDs, required fields, conditions, types, bounds, and options; the server performs final format/pattern validation. Answers accept strings, numbers, booleans, or arrays of strings; nested objects and null are not accepted. For example, `{ "confirmed": true }` answers a boolean field; `{ "choice": "option-id" }` selects a choice by its option key. Forms are not assumed to be binary. This action submits only explicit choices and is not permission approval.
+
+`opencode/job` reports the experimental jobs endpoint: `running`, `completed`, `error`, or `cancelled`. It represents native active and unconsumed jobs, not permanent history. More than 200 jobs fails the source rather than returning a false zero. Endpoint 404/405 is an unsupported-source error, not an empty list. The plugin exposes no job cancellation or result/command payload. Source errors do not fabricate empty or zero data.
+
+`send_to_agent` targets `agent/chats`. It requires `message` (1–16000 characters) and accepts optional nullable `chat_id`. Omit `chat_id` to follow configured mode: use the default session in existing mode or create a session in new mode. Use reserved `chat_id: "new"` to explicitly create a session in the configured directory, including when existing mode is selected. Creation starts a fresh session and sends the first message; follow-up messages target its real session ID. Each `new` send creates another session. An explicit `chat_id` overrides omitted-ID default-mode routing. Existing sessions can be targeted by ID, nickname, or title. Set distinct nicknames in settings; ambiguous titles fail.
+
+`interrupt_session` requires confirmation and an explicit session ID; it stops foreground execution only. `resume: false` prevents automatic resume. An `interrupted: false` response means the session was already idle. It does not cancel detached jobs, and the virtual `new` target is invalid. No automatic POST retries occur for new actions; uncertain outcomes and conflicts return errors, with refresh needed before any deliberate retry. `answer_question` also requires confirmation; caller permissions remain empty for all actions.
 
 New-session mode requires saved server credentials and an absolute server directory, but no existing default session. Its settings hide the recent-session list and default editor; switching to existing mode restores them. The message hint reflects the saved directory, not unsaved text in the directory field. To choose a default, switch to existing mode, select a real session, then choose **Use as default**. A saved directory also makes the virtual `New` target available in existing mode.
 
-Manifest sets `destructive: false` and `requiresConfirmation: false`, matching Claude's UI metadata. These flags do not make actions read-only: prompts may run commands or modify files under OpenCode's configured permissions. This plugin provides no permission bypass and requests no caller permissions. Do not automatically retry uncertain delivery or conflicts.
+Manifest confirmation flags distinguish actions: sending is non-destructive and does not require confirmation; interrupt is destructive and requires confirmation; answering a question is non-destructive but requires confirmation. These flags do not make actions read-only: prompts may run commands or modify files under OpenCode's configured permissions. This plugin provides no permission bypass and requests no caller permissions. Do not automatically retry uncertain delivery or conflicts.
 
 ## Server setup and security
 
@@ -83,6 +98,6 @@ Build writes `build/pebble-opencode.pbw`. Install:
 
 ## Limits and verification
 
-No reply display, background listener, or permission-approval controls. Transport uncertainty is not retried automatically.
+Sources refresh by polling; there is no background listener or SSE. No permission-approval controls are provided. Transport uncertainty is not retried automatically.
 
-Checked against isolated OpenCode 2.2.1 server. Queue tests used `resume: false` to prevent agent execution. Settings tested in a browser with a simulated Pebble bridge. Physical phone/watch testing remains outstanding.
+Unit and fixture tests cover reply text/streaming and all job kinds. Isolated OpenCode 2.2.1 checks verified explicit question answers and settled-question rejection, idle interruption, and the native empty-message envelope; the jobs endpoint returned 404, so live background-job display is unverified. These checks did not invoke provider/model prompt execution. Prior queue and settings checks remain valid; version 0.2.1 was installed on phone, but 0.3.0 and its new sources/actions have not been tested on a physical phone or watch.

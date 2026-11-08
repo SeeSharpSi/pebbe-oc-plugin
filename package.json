@@ -1,7 +1,7 @@
 {
   "name": "pebble-opencode",
   "author": "OpenCode for Pebble contributors",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "scripts": {
     "test": "node --test test/*.test.js",
@@ -17,7 +17,7 @@
       "LocalNetwork"
     ],
     "plugin": {
-      "description": "Send messages to OpenCode and expose active sessions, attention, and activity summary.",
+      "description": "Send messages; expose OpenCode activity, replies, questions, and jobs; interrupt foreground sessions.",
       "script": "src/plugin/index.js",
       "sources": [
         {
@@ -130,6 +130,114 @@
           "supportsMultiple": false,
           "callerPermissions": [],
           "suggestedRefreshIntervalSec": 20
+        },
+        {
+          "category": "opencode",
+          "items": [
+            "reply"
+          ],
+          "properties": {
+            "name": [
+              "shortText",
+              "longText"
+            ],
+            "session_id": [
+              "longText"
+            ],
+            "message_id": [
+              "longText"
+            ],
+            "text": [
+              "shortText",
+              "longText"
+            ],
+            "updated": [
+              "timestamp"
+            ],
+            "complete": [
+              "boolean"
+            ],
+            "status": [
+              "shortText",
+              "longText"
+            ],
+            "url": [
+              "longText"
+            ]
+          },
+          "supportsMultiple": false,
+          "callerPermissions": [],
+          "suggestedRefreshIntervalSec": 20
+        },
+        {
+          "category": "opencode",
+          "items": [
+            "question"
+          ],
+          "properties": {
+            "name": [
+              "shortText",
+              "longText"
+            ],
+            "session_id": [
+              "longText"
+            ],
+            "form_id": [
+              "longText"
+            ],
+            "question": [
+              "longText"
+            ],
+            "fields": [
+              "longText"
+            ],
+            "answerable": [
+              "boolean"
+            ],
+            "url": [
+              "longText"
+            ]
+          },
+          "supportsMultiple": true,
+          "callerPermissions": [],
+          "suggestedRefreshIntervalSec": 20
+        },
+        {
+          "category": "opencode",
+          "items": [
+            "job"
+          ],
+          "properties": {
+            "name": [
+              "shortText",
+              "longText"
+            ],
+            "job_id": [
+              "longText"
+            ],
+            "session_id": [
+              "longText"
+            ],
+            "kind": [
+              "shortText"
+            ],
+            "status": [
+              "shortText",
+              "longText"
+            ],
+            "started": [
+              "timestamp"
+            ],
+            "url": [
+              "longText"
+            ],
+            "child_session_id": [
+              "longText"
+            ]
+          },
+          "supportsMultiple": true,
+          "callerPermissions": [],
+          "suggestedRefreshIntervalSec": 20
         }
       ],
       "actions": [
@@ -163,6 +271,80 @@
           ],
           "destructive": false,
           "requiresConfirmation": false,
+          "callerPermissions": []
+        },
+        {
+          "name": "interrupt_session",
+          "description": "Stop foreground execution in the explicitly identified OpenCode session. The virtual new target is invalid; detached jobs are not cancelled. Do not automatically retry when the result is uncertain.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "session_id": {
+                "type": "string",
+                "pattern": "^ses[A-Za-z0-9_-]{1,160}$",
+                "description": "Explicit OpenCode session ID to interrupt."
+              }
+            },
+            "required": [
+              "session_id"
+            ],
+            "additionalProperties": false
+          },
+          "targets": [
+            "opencode/active_session",
+            "agent/chats",
+            "opencode/reply"
+          ],
+          "destructive": true,
+          "requiresConfirmation": true,
+          "callerPermissions": []
+        },
+        {
+          "name": "answer_question",
+          "description": "Submit explicit choices for the identified OpenCode question after checking its actual fields. This is not permission approval; external desktop-only questions cannot be answered. Do not automatically retry when the result is uncertain.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "session_id": {
+                "type": "string",
+                "pattern": "^ses[A-Za-z0-9_-]{1,160}$",
+                "description": "Explicit OpenCode session ID that owns the question."
+              },
+              "form_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "Form ID returned by opencode/question."
+              },
+              "answer": {
+                "type": "object",
+                "maxProperties": 50,
+                "additionalProperties": {
+                  "anyOf": [
+                    { "type": "string" },
+                    { "type": "number" },
+                    { "type": "boolean" },
+                    {
+                      "type": "array",
+                      "items": { "type": "string" }
+                    }
+                  ]
+                },
+                "description": "Explicit field-value record, bounded to 16000 JSON characters at runtime."
+              }
+            },
+            "required": [
+              "session_id",
+              "form_id",
+              "answer"
+            ],
+            "additionalProperties": false
+          },
+          "targets": [
+            "opencode/question"
+          ],
+          "destructive": false,
+          "requiresConfirmation": true,
           "callerPermissions": []
         }
       ]
