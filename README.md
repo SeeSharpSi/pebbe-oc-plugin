@@ -11,6 +11,8 @@ Sources match the structure and refresh behavior of the [official Claude plugin 
 | `agent/chats` | `name: shortText`, `title: shortText`, `url: longText` | Yes | 900 sec |
 | `agent/configured` | `name: shortText`, `configured: boolean, shortText` | No | 60 sec |
 
+When server credentials are saved and a valid creation directory is configured, `agent/chats` also includes one virtual target: `instanceId: new`, `name: New`, `title: New session`, with no URL. Real chat entries remain root, unarchived chats. The settings recent-session list contains real sessions only. Reading or polling the source never creates a session.
+
 Two OpenCode sources expose live activity:
 
 | Source | Items and properties | Multiple | Refresh |
@@ -42,7 +44,9 @@ A successful empty lookup returns `active_session: []` and one `activity` instan
 
 Each subscription poll performs a fresh bounded scan; there is no persistent cache or background daemon. Limits are 100 active IDs, 200 metadata lookups, 32 parent hops, and 4 concurrent HTTP requests. Limit or cycle failures produce unavailable data, not truncated results. Activity sources use read-only GETs and need only saved server credentials; no default messaging session is required. No approval controls or additional actions are provided.
 
-The only action is `send_to_agent`, targeting `agent/chats`. It requires `message` (1–16000 characters) and accepts optional nullable `chat_id`. Omit `chat_id` to use the configured default or new-session mode. Use reserved value `new` to start a new session in the configured directory. Existing sessions can be targeted by ID, nickname, or title. Set distinct nicknames in settings; ambiguous titles fail.
+The only action is `send_to_agent`, targeting `agent/chats`. It requires `message` (1–16000 characters) and accepts optional nullable `chat_id`. Omit `chat_id` to follow configured mode: use the default session in existing mode or create a session in new mode. Use reserved `chat_id: "new"` to explicitly create a session in the configured directory, including when existing mode is selected. Creation starts a fresh session and sends the first message; follow-up messages target its real session ID. Each `new` send creates another session. An explicit `chat_id` overrides omitted-ID default-mode routing. Existing sessions can be targeted by ID, nickname, or title. Set distinct nicknames in settings; ambiguous titles fail.
+
+New-session mode requires saved server credentials and an absolute server directory, but no existing default session. Its settings hide the recent-session list and default editor; switching to existing mode restores them. The message hint reflects the saved directory, not unsaved text in the directory field. To choose a default, switch to existing mode, select a real session, then choose **Use as default**. A saved directory also makes the virtual `New` target available in existing mode.
 
 Manifest sets `destructive: false` and `requiresConfirmation: false`, matching Claude's UI metadata. These flags do not make actions read-only: prompts may run commands or modify files under OpenCode's configured permissions. This plugin provides no permission bypass and requests no caller permissions. Do not automatically retry uncertain delivery or conflicts.
 
@@ -74,7 +78,7 @@ Build writes `build/pebble-opencode.pbw`. Install:
 
 1. Sideload PBW in Pebble mobile app; enable plugins if required and grant network permissions.
 2. Open plugin settings; enter phone-reachable server URL and password.
-3. Select the default session, or set an absolute server directory and choose new-session mode.
+3. Choose existing-session mode and select a default, or save an absolute server directory and choose new-session mode.
 4. Use Index to send.
 
 ## Limits and verification

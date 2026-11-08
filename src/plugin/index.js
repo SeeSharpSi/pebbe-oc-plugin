@@ -650,15 +650,22 @@
       if (input.category === 'agent' && input.item === 'chats') {
         requireConnection(state);
         var page = await chatRows(state, input.cursor);
+        var chatInstances = page.sessions.map(function (session) {
+          return { instanceId: session.session_id, properties: {
+            name: { shortText: { text: session.nickname || session.title } },
+            title: { shortText: { text: session.title } },
+            url: { longText: { text: session.url } }
+          } };
+        });
+        if (directoryPath(state.directory)) {
+          chatInstances.push({ instanceId: 'new', properties: {
+            name: { shortText: { text: 'New' } },
+            title: { shortText: { text: 'New session' } }
+          } });
+        }
         return {
           validUntilMs: now() + 900000,
-          instances: page.sessions.map(function (session) {
-            return { instanceId: session.session_id, properties: {
-              name: { shortText: { text: session.nickname || session.title } },
-              title: { shortText: { text: session.title } },
-              url: { longText: { text: session.url } }
-            } };
-          })
+          instances: chatInstances
         };
       }
       if (input.category === 'opencode' && input.item === 'active_session') {
