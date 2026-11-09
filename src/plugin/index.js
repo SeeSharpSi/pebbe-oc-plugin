@@ -10,6 +10,7 @@
   var MAX_REPLY_COUNT = 20;
   var DELIVERY_MODES = ['queue', 'steer'];
   var DEFAULT_DELIVERY = 'queue';
+  var MAX_ATTENTION_CHATS = 50;
   var requestCounter = 0;
 
   function makeError(code, message, httpStatus) {
@@ -106,7 +107,7 @@
     return {
       url: '', username: DEFAULT_USERNAME, password: '', version: '', mode: 'default_chat',
       directory: '', selected: null, lastSessionID: null, nicknames: {}, reply_count: DEFAULT_REPLY_COUNT,
-      default_delivery: DEFAULT_DELIVERY, auth_method: ''
+      default_delivery: DEFAULT_DELIVERY, auth_method: '', last_seen: {}
     };
   }
 
@@ -136,6 +137,7 @@
           if (stored && stored[key] !== undefined) state[key] = stored[key];
         });
         if (!state.nicknames || typeof state.nicknames !== 'object' || Array.isArray(state.nicknames)) state.nicknames = {};
+        if (!state.last_seen || typeof state.last_seen !== 'object' || Array.isArray(state.last_seen)) state.last_seen = {};
         if (!Number.isInteger(state.reply_count) || state.reply_count < 1 || state.reply_count > MAX_REPLY_COUNT) {
           state.reply_count = DEFAULT_REPLY_COUNT;
         }
@@ -153,7 +155,7 @@
 
     function refresh() {
       if (root.Pebble && typeof root.Pebble.refreshSources === 'function') {
-        try { root.Pebble.refreshSources(['agent/chats', 'agent/configured', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/question', 'opencode/job']); } catch (_) {}
+        try { root.Pebble.refreshSources(['agent/chats', 'agent/configured', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/chat_status', 'opencode/permission', 'opencode/question', 'opencode/job']); } catch (_) {}
       }
     }
 
@@ -675,6 +677,172 @@
       return { validUntilMs: now() + 60000, instances: instances };
     }
 
+    function validPermissionRequest(item) {
+      if (!isPlainObject(item) || !nonemptyID(item.id) || !sessionID(item.sessionID) ||
+          typeof item.action !== 'string' || !item.action || !Array.isArray(item.resources) ||
+          item.resources.some(function (resource) { return typeof resource !== 'string'; }) ||
+          (item.message !== undefined && typeof item.message !== 'string')) {
+        throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid permission data.');
+      }
+      return item;
+    }
+
+    async function pendingPermissions(state) {
+      var response = await api(state, '/permission/request');
+      if (!response || !Array.isArray(response.data)) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid permission data.');
+      return response.data.map(validPermissionRequest);
+    }
+
+    function validFormSummary(item) {
+      if (!isPlainObject(item) || !nonemptyID(item.id) || !sessionID(item.sessionID) ||
+          typeof item.title !== 'string' || !Array.isArray(item.fields)) {
+        throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid question data.');
+      }
+      return item;
+    }
+
+    async function pendingForms(state) {
+      var response = await api(state, '/form');
+      if (!response || !Array.isArray(response.data)) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid question data.');
+      return response.data.map(validFormSummary);
+    }
+
+    function metaFromRow(row) {
+      return {
+        session_id: row.session_id, title: row.title, nickname: row.nickname || '',
+        updated: row.updated_at || 0, is_subagent: false
+      };
+    }
+
+    function metaFromSession(state, session) {
+      return {
+        session_id: session.id, title: titleOf(session), nickname: state.nicknames[session.id] || '',
+        updated: Number(session.time.updated || session.time.created) || 0,
+        is_subagent: Boolean(session.parentID)
+      };
+    }
+
+    async function sessionMetas(state, ids, recentMap) {
+      var metas = Object.create(null);
+      ids.forEach(function (id) {
+        if (recentMap[id]) metas[id] = metaFromRow(recentMap[id]);
+      });
+      var missing = ids.filter(function (id) { return !metas[id]; });
+      var limit = createLimiter(4);
+      try {
+        await Promise.all(missing.map(async function (id) {
+          var session = await limit(function () { return getSession(state, id); });
+          metas[id] = metaFromSession(state, session);
+        }));
+      } catch (err) {
+        limit.stop(err);
+        throw err;
+      }
+      return metas;
+    }
+
+    function chatStatusInstance(state, meta, reply, permissionCount, questionCount, defaultID) {
+      var name = meta.nickname || meta.title;
+      var unread = !!(reply && state.last_seen[meta.session_id] !== reply.message.id);
+      var reason = permissionCount > 0 ? 'permission' : questionCount > 0 ? 'question' : unread ? 'unread' : 'none';
+      var shortReason = reason === 'permission' ? 'Perm' : reason === 'question' ? 'Ask' : reason === 'unread' ? 'Unread' : 'None';
+      var longReason = reason === 'permission' ? 'Permission' : reason === 'question' ? 'Question' : reason === 'unread' ? 'Unread' : 'None';
+      var properties = {
+        name: { shortText: { text: unicodePrefix(name, 7) }, longText: { text: name } },
+        title: { longText: { text: meta.title } },
+        session_id: { longText: { text: meta.session_id } },
+        needs_action: { boolean: { value: reason !== 'none' } },
+        reason: { shortText: { text: shortReason }, longText: { text: longReason } },
+        permission_count: { numericValue: { value: permissionCount, min: 0 }, shortText: { text: String(permissionCount) } },
+        question_count: { numericValue: { value: questionCount, min: 0 }, shortText: { text: String(questionCount) } },
+        unread: { boolean: { value: unread } },
+        is_default: { boolean: { value: meta.session_id === defaultID } },
+        is_subagent: { boolean: { value: meta.is_subagent } },
+        url: { longText: { text: sessionURL(state.url, meta.session_id) } }
+      };
+      if (reply) properties.message_id = { longText: { text: reply.message.id } };
+      var updated = reply ? (typeof reply.message.time.completed === 'number' ? reply.message.time.completed : reply.message.time.created) : meta.updated;
+      if (typeof updated === 'number' && Number.isFinite(updated) && updated >= 0) {
+        properties.updated = { timestamp: { value: Math.floor(updated / 1000) } };
+      }
+      return { instanceId: meta.session_id, properties: properties };
+    }
+
+    async function chatStatusInstances(state) {
+      var loaded = await Promise.all([chatRows(state, null), pendingPermissions(state), pendingForms(state)]);
+      var recent = loaded[0].sessions;
+      var permissions = loaded[1];
+      var forms = loaded[2];
+      var recentMap = Object.create(null);
+      recent.forEach(function (row) { if (!recentMap[row.session_id]) recentMap[row.session_id] = row; });
+      var permissionCounts = Object.create(null);
+      var questionCounts = Object.create(null);
+      permissions.forEach(function (item) { permissionCounts[item.sessionID] = (permissionCounts[item.sessionID] || 0) + 1; });
+      forms.forEach(function (item) { questionCounts[item.sessionID] = (questionCounts[item.sessionID] || 0) + 1; });
+      var defaultID = state.mode === 'default_chat' && state.selected && sessionID(state.selected.session_id) ? state.selected.session_id : null;
+      var lastID = sessionID(state.lastSessionID) ? state.lastSessionID : null;
+      var ids = [];
+      var seen = Object.create(null);
+      function add(id) {
+        if (!id || seen[id]) return;
+        seen[id] = true;
+        ids.push(id);
+      }
+      add(defaultID);
+      add(lastID);
+      recent.slice(0, state.reply_count).forEach(function (row) { add(row.session_id); });
+      permissions.forEach(function (item) { add(item.sessionID); });
+      forms.forEach(function (item) { add(item.sessionID); });
+      if (ids.length > MAX_ATTENTION_CHATS) throw makeError('PLUGIN_UNAVAILABLE', 'Too many chats to inspect safely.');
+      var metas = await sessionMetas(state, ids, recentMap);
+      var limit = createLimiter(4);
+      var instances;
+      try {
+        instances = await Promise.all(ids.map(function (id) {
+          return limit(async function () {
+            var reply = await latestAssistantReply(state, id);
+            return chatStatusInstance(state, metas[id], reply, permissionCounts[id] || 0, questionCounts[id] || 0, defaultID);
+          });
+        }));
+      } catch (err) {
+        limit.stop(err);
+        throw err;
+      }
+      return { validUntilMs: now() + 20000, instances: instances };
+    }
+
+    async function permissionInstances(state) {
+      var permissions = await pendingPermissions(state);
+      if (!permissions.length) return { validUntilMs: now() + 20000, instances: [] };
+      if (permissions.length > MAX_ATTENTION_CHATS) throw makeError('PLUGIN_UNAVAILABLE', 'Too many permission requests to inspect safely.');
+      var recent = await chatRows(state, null);
+      var recentMap = Object.create(null);
+      recent.sessions.forEach(function (row) { if (!recentMap[row.session_id]) recentMap[row.session_id] = row; });
+      var ids = [];
+      permissions.forEach(function (item) { if (ids.indexOf(item.sessionID) === -1) ids.push(item.sessionID); });
+      var metas = await sessionMetas(state, ids, recentMap);
+      permissions.sort(function (a, b) {
+        return a.sessionID < b.sessionID ? -1 : a.sessionID > b.sessionID ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+      });
+      return { validUntilMs: now() + 20000, instances: permissions.map(function (item) {
+        var meta = metas[item.sessionID];
+        var name = meta.nickname || meta.title;
+        var properties = {
+          name: { shortText: { text: unicodePrefix(name, 7) }, longText: { text: name } },
+          title: { longText: { text: meta.title } },
+          session_id: { longText: { text: item.sessionID } },
+          request_id: { longText: { text: item.id } },
+          action: { shortText: { text: unicodePrefix(item.action, 7) }, longText: { text: item.action } },
+          url: { longText: { text: sessionURL(state.url, item.sessionID) } }
+        };
+        var resources = JSON.stringify(item.resources);
+        if (resources.length > 16000) throw makeError('PLUGIN_UNAVAILABLE', 'Permission resources exceed safe display size.');
+        properties.resources = { longText: { text: resources } };
+        if (typeof item.message === 'string' && item.message) properties.message = { longText: { text: item.message } };
+        return { instanceId: item.sessionID + ':' + item.id, properties: properties };
+      }) };
+    }
+
     async function jobInstances(state) {
       var response;
       try { response = await api(state, '/experimental/job'); }
@@ -880,6 +1048,7 @@
           candidate.selected = null;
           candidate.lastSessionID = null;
           candidate.nicknames = {};
+          candidate.last_seen = {};
           candidate.mode = 'default_chat';
         }
         candidate.version = version;
@@ -909,6 +1078,7 @@
           pairCandidate.selected = null;
           pairCandidate.lastSessionID = null;
           pairCandidate.nicknames = {};
+          pairCandidate.last_seen = {};
           pairCandidate.mode = 'default_chat';
         }
         pairCandidate.version = pairVersion;
@@ -1095,6 +1265,14 @@
         requireConnection(state);
         return await repliesInstances(state);
       }
+      if (input.category === 'opencode' && input.item === 'chat_status') {
+        requireConnection(state);
+        return await chatStatusInstances(state);
+      }
+      if (input.category === 'opencode' && input.item === 'permission') {
+        requireConnection(state);
+        return await permissionInstances(state);
+      }
       if (input.category === 'opencode' && input.item === 'job') {
         requireConnection(state);
         return { validUntilMs: now() + 20000, instances: await jobInstances(state) };
@@ -1152,7 +1330,71 @@
       return false;
     }
 
-    var refreshedActions = ['agent/chats', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/question', 'opencode/job'];
+    var refreshedActions = ['agent/chats', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/chat_status', 'opencode/permission', 'opencode/question', 'opencode/job'];
+
+    async function approvePermissionAction(state, args) {
+      if (!isPlainObject(args)) throw makeError('INVALID_ARGS', 'Invalid permission response.');
+      Object.keys(args).forEach(function (key) {
+        if (key !== 'session_id' && key !== 'request_id' && key !== 'decision' && key !== 'message') {
+          throw makeError('INVALID_ARGS', 'Unexpected action argument.');
+        }
+      });
+      if (!sessionID(args.session_id) || !nonemptyID(args.request_id)) throw makeError('INVALID_ARGS', 'Invalid permission request.');
+      var decision = args.decision === undefined ? 'once' : args.decision;
+      if (decision !== 'once' && decision !== 'reject') throw makeError('INVALID_ARGS', 'Decision must be once or reject.');
+      if (args.message !== undefined && (typeof args.message !== 'string' || args.message.length > 2000)) {
+        throw makeError('INVALID_ARGS', 'Permission message is invalid.');
+      }
+      var session = await getSession(state, args.session_id);
+      if (archived(session)) throw makeError('INVALID_ARGS', 'Archived sessions cannot receive permission responses.');
+      var detail;
+      try { detail = await api(state, sessionPath(args.session_id) + '/permission/' + encodeURIComponent(args.request_id)); }
+      catch (err) {
+        if (err && err.httpStatus === 404) throw makeError('INVALID_ARGS', 'Permission request not found or already settled. Refresh first.');
+        throw err;
+      }
+      var request = validPermissionRequest(detail && detail.data);
+      if (request.id !== args.request_id || request.sessionID !== args.session_id) {
+        throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned a different permission request.');
+      }
+      var body = { decision: decision };
+      if (args.message) body.message = args.message;
+      try {
+        await api(state, sessionPath(args.session_id) + '/permission/' + encodeURIComponent(args.request_id) + '/reply', 'POST', body, 204);
+      } catch (err) {
+        if (err && err.httpStatus === 400) throw makeError('INVALID_ARGS', 'OpenCode rejected the permission response.');
+        if (err && err.httpStatus === 404) throw makeError('INVALID_ARGS', 'Permission request not found or already settled. Refresh first.');
+        if (err && err.httpStatus === 409) throw makeError('INVALID_ARGS', 'Permission request already settled. Refresh first.');
+        if (err && (err.code === 'PERMISSION_DENIED' || err.code === 'AUTH_REQUIRED' || err.code === 'RATE_LIMITED')) throw err;
+        if (err && err.httpStatus && err.httpStatus < 500) throw err;
+        throw makeError('PLUGIN_UNAVAILABLE', 'Permission response uncertain. Inspect OpenCode before retrying.');
+      }
+      return {
+        text: (decision === 'once' ? 'Permission approved: ' : 'Permission rejected: ') + request.action,
+        refreshed: refreshedActions
+      };
+    }
+
+    async function markChatReadAction(state, args) {
+      if (!isPlainObject(args)) throw makeError('INVALID_ARGS', 'Invalid read request.');
+      Object.keys(args).forEach(function (key) {
+        if (key !== 'session_id' && key !== 'message_id') throw makeError('INVALID_ARGS', 'Unexpected action argument.');
+      });
+      if (!sessionID(args.session_id)) throw makeError('INVALID_ARGS', 'Invalid session ID.');
+      if (args.message_id !== undefined && !nonemptyID(args.message_id)) throw makeError('INVALID_ARGS', 'Invalid message ID.');
+      var session = await getSession(state, args.session_id);
+      var messageID = args.message_id;
+      if (!messageID) {
+        var reply = await latestAssistantReply(state, session.id);
+        if (!reply) return { text: 'Chat has no reply to mark read: ' + titleOf(session), refreshed: ['opencode/chat_status'] };
+        messageID = reply.message.id;
+      }
+      var fresh = await load();
+      if (!fresh.last_seen || typeof fresh.last_seen !== 'object' || Array.isArray(fresh.last_seen)) fresh.last_seen = {};
+      fresh.last_seen[session.id] = messageID;
+      await save(fresh);
+      return { text: 'Chat marked read: ' + titleOf(session), refreshed: ['opencode/chat_status'] };
+    }
 
     async function interruptAction(state, args) {
       if (!isPlainObject(args) || Object.keys(args).length !== 1 || !sessionID(args.session_id)) throw makeError('INVALID_ARGS', 'Invalid session ID.');
@@ -1265,11 +1507,14 @@
     }
 
     async function action(input) {
-      if (input && (input.action === 'interrupt_session' || input.action === 'answer_question')) {
+      if (input && ['interrupt_session', 'answer_question', 'approve_permission', 'mark_chat_read'].indexOf(input.action) !== -1) {
         if (!input.args || typeof input.args !== 'object' || Array.isArray(input.args)) throw makeError('INVALID_ARGS', 'Invalid action request.');
         var controlState = await load();
         requireConnection(controlState);
-        return input.action === 'interrupt_session' ? interruptAction(controlState, input.args) : answerAction(controlState, input.args);
+        if (input.action === 'interrupt_session') return interruptAction(controlState, input.args);
+        if (input.action === 'answer_question') return answerAction(controlState, input.args);
+        if (input.action === 'approve_permission') return approvePermissionAction(controlState, input.args);
+        return markChatReadAction(controlState, input.args);
       }
       if (!input || typeof input !== 'object' || input.action !== 'send_to_agent' ||
           !input.args || typeof input.args !== 'object' || Array.isArray(input.args)) {

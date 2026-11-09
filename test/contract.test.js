@@ -232,7 +232,7 @@ test('direct ID send, returns queued receipt description and does not include mo
   const h = harness(); await connected(h); addPrompt(h, 'ses_a', 'Alpha');
   const result = await h.service.action({ action: 'send_to_agent', args: { message: 'hello', chat_id: 'ses_a' } });
   assert.match(result.text, /Alpha/);
-  assert.deepEqual(result.refreshed, ['agent/chats', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/question', 'opencode/job']);
+  assert.deepEqual(result.refreshed, ['agent/chats', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/chat_status', 'opencode/permission', 'opencode/question', 'opencode/job']);
   assert.equal(h.requests.filter(req => req.method === 'POST' && req.path.endsWith('/prompt')).length, 1);
   assert.deepEqual(h.requests.find(req => req.path.endsWith('/prompt')).body, { id: h.requests.find(req => req.path.endsWith('/prompt')).body.id, text: 'hello', delivery: 'queue' });
   assert.match(h.requests.find(req => req.path.endsWith('/prompt')).body.id, /^msg_/);
