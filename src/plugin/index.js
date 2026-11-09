@@ -155,7 +155,7 @@
 
     function refresh() {
       if (root.Pebble && typeof root.Pebble.refreshSources === 'function') {
-        try { root.Pebble.refreshSources(['agent/chats', 'agent/configured', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/chat_status', 'opencode/permission', 'opencode/question', 'opencode/job']); } catch (_) {}
+        try { root.Pebble.refreshSources(['agent/chats', 'agent/configured', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/chat_status', 'opencode/permission', 'opencode/question', 'opencode/job', 'opencode/usage']); } catch (_) {}
       }
     }
 
@@ -843,6 +843,64 @@
       }) };
     }
 
+    function usageMeter(meter, label) {
+      if (!isPlainObject(meter) || typeof meter.percent !== 'number' || !Number.isFinite(meter.percent) ||
+          meter.percent < 0 || meter.percent > 100 || typeof meter.limited !== 'boolean' ||
+          typeof meter.resetsAt !== 'number' || !Number.isFinite(meter.resetsAt) || meter.resetsAt < 0) {
+        throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid Go usage data.');
+      }
+      return { percent: meter.percent, limited: meter.limited, resetsAt: meter.resetsAt, label: label };
+    }
+
+    function percentText(value) {
+      return String(Math.round(value)) + '%';
+    }
+
+    async function goUsageInstances(state) {
+      var response;
+      try { response = await api(state, '/experimental/usage/limits'); }
+      catch (err) {
+        if (err && (err.httpStatus === 404 || err.httpStatus === 405)) {
+          throw makeError('PLUGIN_UNAVAILABLE', 'Go usage is not supported by this OpenCode server.');
+        }
+        throw err;
+      }
+      if (!response || !Object.prototype.hasOwnProperty.call(response, 'data')) {
+        throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid Go usage data.');
+      }
+      if (response.data === null) return [];
+      if (!isPlainObject(response.data) || !isPlainObject(response.data.workspace) ||
+          !nonemptyID(response.data.workspace.id) || typeof response.data.workspace.usageURL !== 'string') {
+        throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid Go usage data.');
+      }
+      if (response.data.go === undefined) return [];
+      if (!isPlainObject(response.data.go)) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid Go usage data.');
+      var rolling = usageMeter(response.data.go.rolling, '5h');
+      var weekly = usageMeter(response.data.go.weekly, 'Week');
+      var monthly = usageMeter(response.data.go.monthly, 'Month');
+      var meters = [rolling, weekly, monthly];
+      var limited = meters.some(function (meter) { return meter.limited; });
+      var maxPercent = Math.max(rolling.percent, weekly.percent, monthly.percent);
+      var workspace = response.data.workspace;
+      var title = typeof workspace.name === 'string' && workspace.name ? workspace.name : 'OpenCode Go';
+      var properties = {
+        name: { shortText: { text: unicodePrefix(title, 7) }, longText: { text: title } },
+        workspace_id: { longText: { text: workspace.id } },
+        go_rolling_percent: { numericValue: { value: rolling.percent, min: 0, max: 100 }, shortText: { text: percentText(rolling.percent) } },
+        go_weekly_percent: { numericValue: { value: weekly.percent, min: 0, max: 100 }, shortText: { text: percentText(weekly.percent) } },
+        go_monthly_percent: { numericValue: { value: monthly.percent, min: 0, max: 100 }, shortText: { text: percentText(monthly.percent) } },
+        go_rolling_resets: { timestamp: { value: Math.floor(rolling.resetsAt / 1000) } },
+        go_weekly_resets: { timestamp: { value: Math.floor(weekly.resetsAt / 1000) } },
+        go_monthly_resets: { timestamp: { value: Math.floor(monthly.resetsAt / 1000) } },
+        limited: { boolean: { value: limited }, shortText: { text: limited ? 'Yes' : 'No' } },
+        status: { shortText: { text: limited ? 'Limited' : 'Active' }, longText: { text: limited ? 'Go limit reached' : 'Go usage available' } },
+        summary: { shortText: { text: percentText(maxPercent) }, longText: { text: 'Go: 5h ' + percentText(rolling.percent) + ', week ' + percentText(weekly.percent) + ', month ' + percentText(monthly.percent) } },
+        checked_at: { timestamp: { value: Math.floor(now() / 1000) } }
+      };
+      if (workspace.usageURL) properties.usage_url = { longText: { text: workspace.usageURL } };
+      return [{ instanceId: workspace.id, properties: properties }];
+    }
+
     async function jobInstances(state) {
       var response;
       try { response = await api(state, '/experimental/job'); }
@@ -1272,6 +1330,10 @@
       if (input.category === 'opencode' && input.item === 'permission') {
         requireConnection(state);
         return await permissionInstances(state);
+      }
+      if (input.category === 'opencode' && input.item === 'usage') {
+        requireConnection(state);
+        return { validUntilMs: now() + 60000, instances: await goUsageInstances(state) };
       }
       if (input.category === 'opencode' && input.item === 'job') {
         requireConnection(state);

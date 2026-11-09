@@ -1,7 +1,7 @@
 {
   "name": "pebble-opencode",
   "author": "OpenCode for Pebble contributors",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "scripts": {
     "test": "node --test test/*.test.js",
@@ -17,7 +17,7 @@
       "LocalNetwork"
     ],
     "plugin": {
-      "description": "Send messages; expose OpenCode activity, replies, chat attention, permissions, questions, and jobs; interrupt foreground sessions.",
+      "description": "Send messages; expose OpenCode activity, replies, chat attention, permissions, questions, jobs, and OpenCode Go usage only; interrupt foreground sessions.",
       "script": "src/plugin/index.js",
       "sources": [
         {
@@ -373,6 +373,63 @@
           "supportsMultiple": true,
           "callerPermissions": [],
           "suggestedRefreshIntervalSec": 20
+        },
+        {
+          "category": "opencode",
+          "items": [
+            "usage"
+          ],
+          "properties": {
+            "name": [
+              "shortText",
+              "longText"
+            ],
+            "workspace_id": [
+              "longText"
+            ],
+            "usage_url": [
+              "longText"
+            ],
+            "go_rolling_percent": [
+              "numericValue",
+              "shortText"
+            ],
+            "go_weekly_percent": [
+              "numericValue",
+              "shortText"
+            ],
+            "go_monthly_percent": [
+              "numericValue",
+              "shortText"
+            ],
+            "go_rolling_resets": [
+              "timestamp"
+            ],
+            "go_weekly_resets": [
+              "timestamp"
+            ],
+            "go_monthly_resets": [
+              "timestamp"
+            ],
+            "limited": [
+              "boolean",
+              "shortText"
+            ],
+            "status": [
+              "shortText",
+              "longText"
+            ],
+            "summary": [
+              "shortText",
+              "longText"
+            ],
+            "checked_at": [
+              "timestamp"
+            ]
+          },
+          "supportsMultiple": false,
+          "callerPermissions": [],
+          "suggestedRefreshIntervalSec": 60
         }
       ],
       "actions": [
