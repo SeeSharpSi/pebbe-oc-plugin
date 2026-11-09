@@ -24,7 +24,7 @@ function assertPrompt(h, delivery) {
 }
 
 function status(state, extra = {}) {
-  return { connected: false, configured: false, url: '', username: 'opencode', version: '', mode: 'default_chat', directory: '', selected: null, nicknames: {}, reply_count: 10, default_delivery: 'queue', ...state, ...extra };
+  return { connected: false, configured: false, url: '', username: 'opencode', version: '', mode: 'default_chat', directory: '', selected: null, nicknames: {}, reply_count: 10, default_delivery: 'queue', auth_method: '', ...state, ...extra };
 }
 
 test('default delivery is queue, accepts both modes, persists without network, and rejects invalid values', async () => {

@@ -49,7 +49,7 @@
   <header>
     <h1>OpenCode settings</h1>
     <p class="muted">Configure the OpenCode server and choose where Pebble sends messages.</p>
-    <p class="warning"><strong>Important:</strong> Prompts may modify files or run commands through the configured agent. HTTP sends your password in cleartext; use HTTPS or a trusted encrypted network.</p>
+    <p class="warning"><strong>Important:</strong> Prompts may modify files or run commands through the configured agent. HTTP sends your password and pairing tokens in cleartext; use HTTPS or a trusted encrypted network.</p>
   </header>
 
   <section class="card" aria-labelledby="connectionHeading">
@@ -57,11 +57,12 @@
     <div class="statusline" aria-live="polite">
       <span id="readyBadge" class="badge">Plugin not ready</span>
       <span id="connectionBadge" class="badge">Disconnected</span>
+      <span id="authMethodText" class="muted"></span>
       <span id="versionText" class="muted"></span>
     </div>
     <p id="configuredText" class="muted">No saved connection.</p>
     <details id="connectDetails">
-      <summary id="connectSummary">Connect and save server</summary>
+      <summary id="connectSummary">Connect with password</summary>
       <form id="connectForm" autocomplete="off">
         <div class="grid">
           <div class="field"><label for="serverUrl">Server URL</label><input id="serverUrl" type="url" required placeholder="https://opencode.example.com or http://192.168.1.10:4096"></div>
@@ -70,6 +71,14 @@
         </div>
         <p class="hint">Password is used for connection setup, stored securely by the plugin, and never returned to this page.</p>
         <div class="actions"><button class="primary" id="connectButton" type="submit" disabled>Test and save connection</button></div>
+      </form>
+    </details>
+    <details id="pairDetails">
+      <summary id="pairSummary">Connect with pairing link</summary>
+      <form id="pairForm" autocomplete="off">
+        <div class="field"><label for="pairLink">Pairing link</label><input id="pairLink" type="url" required placeholder="http://host:49374/auth/connect/..." autocomplete="off"></div>
+        <p class="hint">Run <code>opencode pair</code>, copy the printed link, and paste it here. The link is single-use and expires after 5 minutes. Paste it directly; do not open it in a browser first.</p>
+        <div class="actions"><button class="primary" id="pairButton" type="submit" disabled>Connect with pairing link</button></div>
       </form>
     </details>
     <div class="actions">
@@ -132,13 +141,14 @@
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
-  const state = { ready:false, connected:false, configured:false, busy:false, mode:'default_chat', directory:'', selected:null, nicknames:{}, sessions:[], cursor:null, projects:[], version:'', url:'', username:'opencode', replyCount:10, defaultDelivery:'queue' };
+  const state = { ready:false, connected:false, configured:false, busy:false, mode:'default_chat', directory:'', selected:null, nicknames:{}, sessions:[], cursor:null, projects:[], version:'', url:'', username:'opencode', replyCount:10, defaultDelivery:'queue', authMethod:'' };
   let editingSessionId=null;
   const controls = ['connectButton','testButton','disconnectButton','modeOptions','directory','saveDirectory','loadProjects','projectSelect','searchSessions','refreshSessions','loadMore','nickname','saveNickname','clearNickname','useDefault'];
   function feedback(message,error=false) { $('feedback').textContent=message||''; $('feedback').classList.toggle('error',error); $('feedback').setAttribute('role',error?'alert':'status'); }
   function render() {
     $('readyBadge').textContent=state.ready?'Plugin ready':'Plugin not ready'; $('readyBadge').classList.toggle('good',state.ready);
     $('connectionBadge').textContent=state.connected?'Saved connection':'No saved connection'; $('connectionBadge').classList.toggle('good',state.connected);
+    $('authMethodText').textContent=state.connected&&state.authMethod?(state.authMethod==='pair'?'Pairing link':'Password'):'';
     $('versionText').textContent=state.connected&&state.version?`OpenCode ${state.version}`:'';
     if(!state.connected) $('configuredText').textContent='No verified saved connection.';
     else if(state.mode==='new_chat') {
@@ -154,6 +164,7 @@
     $('recentSessions').hidden=state.mode==='new_chat';
     $('connectDetails').hidden=false;
     for(const id of ['serverUrl','username','password']) $(id).disabled=!state.ready||state.busy;
+    $('pairLink').disabled=!state.ready||state.busy; $('pairButton').disabled=!state.ready||state.busy;
     $('modeDefault').checked=state.mode==='default_chat'; $('modeNew').checked=state.mode==='new_chat';
     const selected=Boolean(editingSessionId);
     for(const id of controls) $(id).disabled=!state.ready||state.busy||!state.connected;
@@ -214,6 +225,7 @@
     state.mode=data.mode||'default_chat';state.directory=data.directory||'';state.selected=data.selected||null;state.nicknames=data.nicknames||{};
     if(Number.isInteger(data.reply_count))state.replyCount=data.reply_count;
     if(data.default_delivery==='queue'||data.default_delivery==='steer')state.defaultDelivery=data.default_delivery;
+    state.authMethod=data.auth_method==='pair'?'pair':data.auth_method==='password'?'password':'';
     $('serverUrl').value=state.url||'';$('username').value=state.username||'opencode';$('directory').value=state.directory;$('nickname').value=editingSessionId?(state.nicknames[editingSessionId]||''):'';
     if(!data.connected)$('connectDetails').open=true;
     if(!data.connected)resetRemoteData();else if(!editingSessionId&&state.selected)editingSessionId=state.selected.session_id;
@@ -262,9 +274,23 @@
       if(!status.connected)throw new Error('Connection was not established.');
       applyStatus(status);
       if(oldKey!==`${state.url}\n${state.username}`)resetRemoteData();
-      $('connectDetails').open=false;
+      $('connectDetails').open=false; $('pairDetails').open=false;
       if(state.mode==='default_chat')await loadSessions(false);
       feedback('Connection saved.');
+    });
+  });
+  $('pairForm').addEventListener('submit',event=>{
+    event.preventDefault();
+    if(!$('pairForm').reportValidity())return;
+    const link=$('pairLink').value.trim();
+    run(async()=>{
+      const oldKey=`${state.url}\n${state.username}`,status=await send({type:'pair',link});
+      if(!status.connected)throw new Error('Pairing connection was not established.');
+      applyStatus(status);
+      if(oldKey!==`${state.url}\n${state.username}`)resetRemoteData();
+      $('pairDetails').open=false; $('connectDetails').open=false; $('pairLink').value='';
+      if(state.mode==='default_chat')await loadSessions(false);
+      feedback('Pairing connection saved.');
     });
   });
   $('testButton').addEventListener('click',()=>run(async()=>{

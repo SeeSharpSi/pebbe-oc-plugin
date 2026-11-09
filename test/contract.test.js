@@ -36,7 +36,7 @@ test('manifest and source/action declarations match public contract', () => {
 
 test('status has exact public shape and omits secret', async () => {
   const h = harness();
-  assert.deepEqual(await h.service.config({ type: 'status' }), { connected: false, configured: false, url: '', username: 'opencode', version: '', mode: 'default_chat', directory: '', selected: null, nicknames: {}, reply_count: 10, default_delivery: 'queue' });
+  assert.deepEqual(await h.service.config({ type: 'status' }), { connected: false, configured: false, url: '', username: 'opencode', version: '', mode: 'default_chat', directory: '', selected: null, nicknames: {}, reply_count: 10, default_delivery: 'queue', auth_method: '' });
 });
 
 test('reply_count defaults to 10, accepts only integers 1..20, and persists without network', async () => {
@@ -512,6 +512,6 @@ test('settings inline scripts parse and settings page uses Pebble plugin message
   assert.match(html, /Pebble\.addEventListener\(['"]ready['"]/);
   assert.match(html, /sendMessage/);
   assert.match(html, /type="password"/);
-  assert.match(html, /HTTP sends your password in cleartext/);
+  assert.match(html, /HTTP sends your password and pairing tokens in cleartext/);
   assert.doesNotMatch(html, /innerHTML\s*=/);
 });

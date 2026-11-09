@@ -106,7 +106,7 @@
     return {
       url: '', username: DEFAULT_USERNAME, password: '', version: '', mode: 'default_chat',
       directory: '', selected: null, lastSessionID: null, nicknames: {}, reply_count: DEFAULT_REPLY_COUNT,
-      default_delivery: DEFAULT_DELIVERY
+      default_delivery: DEFAULT_DELIVERY, auth_method: ''
     };
   }
 
@@ -140,6 +140,8 @@
           state.reply_count = DEFAULT_REPLY_COUNT;
         }
         if (!validDelivery(state.default_delivery)) state.default_delivery = DEFAULT_DELIVERY;
+        if (!state.password) state.auth_method = '';
+        else if (state.auth_method !== 'pair') state.auth_method = 'password';
         return state;
       } catch (_) { return emptyState(); }
     }
@@ -166,7 +168,8 @@
         configured: configured(state), url: state.url || '', username: state.username || DEFAULT_USERNAME,
         version: state.version || '', mode: state.mode || 'default_chat', directory: state.directory || '',
         selected: state.selected || null, nicknames: state.nicknames || {},
-        reply_count: state.reply_count, default_delivery: state.default_delivery || DEFAULT_DELIVERY
+        reply_count: state.reply_count, default_delivery: state.default_delivery || DEFAULT_DELIVERY,
+        auth_method: state.auth_method || ''
       };
     }
 
@@ -209,6 +212,38 @@
     }
 
     function api(state, path, method, body, expectedStatus) { return request(state, '/api' + path, method, body, expectedStatus); }
+
+    async function redeemPairingLink(value) {
+      var link;
+      try { link = cleanURL(value); }
+      catch (_) { throw makeError('INVALID_ARGS', 'Enter an OpenCode pairing link.'); }
+      var match = /^(https?:\/\/[^/]+)\/auth\/connect\/[^/]+$/.exec(link);
+      if (!match) throw makeError('INVALID_ARGS', 'Enter an OpenCode pairing link.');
+      var response;
+      try {
+        response = await fetcher(link, {
+          method: 'GET', headers: { Accept: 'application/json' }, redirect: 'error'
+        });
+      } catch (fetchError) {
+        if (fetchError && fetchError.name === 'NotAllowedError') throw makeError('PERMISSION_DENIED', 'OpenCode access is not permitted.');
+        throw makeError('PLUGIN_UNAVAILABLE', 'Pairing request failed.');
+      }
+      if (!response || typeof response.status !== 'number') throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned an invalid pairing response.');
+      if (response.status === 400 || response.status === 401 || response.status === 404 || response.status === 410) {
+        throw makeError('INVALID_ARGS', 'Pairing link is invalid or expired. Run opencode pair again.');
+      }
+      if (response.status === 403) throw makeError('PERMISSION_DENIED', 'OpenCode access is not permitted.');
+      if (response.status === 429) throw makeError('RATE_LIMITED', 'OpenCode rate limit reached.');
+      if (response.status < 200 || response.status >= 300) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode pairing request was rejected.');
+      var body;
+      try { body = await response.json(); }
+      catch (_) { throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned an invalid pairing response.'); }
+      if (!body || typeof body.token !== 'string' || !body.token || body.token.length > 4096) {
+        throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned an invalid pairing response.');
+      }
+      return { origin: match[1], token: body.token };
+    }
+
     function sessionID(id) { return typeof id === 'string' && /^ses[A-Za-z0-9_-]{1,160}$/.test(id); }
     function sessionPath(id) { return '/session/' + encodeURIComponent(id); }
     function titleOf(session) { return typeof session.title === 'string' && session.title ? session.title : 'Untitled session'; }
@@ -836,7 +871,7 @@
         var username = typeof input.username === 'string' && input.username.trim() ? input.username.trim() : DEFAULT_USERNAME;
         if (/[\u0000-\u001f\u007f:]/.test(username)) throw makeError('INVALID_ARGS', 'Username must not contain colons or control characters.');
         if (typeof input.password !== 'string' || !input.password) throw makeError('INVALID_ARGS', 'Password is required.');
-        var candidate = Object.assign({}, state, { url: url, username: username, password: input.password });
+        var candidate = Object.assign({}, state, { url: url, username: username, password: input.password, auth_method: 'password' });
         var info = await api(candidate, '/info');
         var version = info && info.version;
         if (typeof version !== 'string' || !/^2\./.test(version)) throw makeError('INVALID_ARGS', 'OpenCode V2 server required.');
@@ -851,6 +886,35 @@
         await save(candidate);
         refresh();
         return status(candidate);
+      }
+
+      if (type === 'pair') {
+        if (typeof input.link !== 'string' || !input.link.trim()) throw makeError('INVALID_ARGS', 'Enter an OpenCode pairing link.');
+        var paired = await redeemPairingLink(input.link.trim());
+        var pairCandidate = Object.assign({}, state, {
+          url: paired.origin, username: DEFAULT_USERNAME, password: paired.token, auth_method: 'pair'
+        });
+        var pairInfo;
+        try { pairInfo = await api(pairCandidate, '/info'); }
+        catch (pairError) {
+          if (pairError && pairError.code === 'AUTH_REQUIRED') {
+            throw makeError('INVALID_ARGS', 'Pairing token was rejected by the server.');
+          }
+          throw pairError;
+        }
+        var pairVersion = pairInfo && pairInfo.version;
+        if (typeof pairVersion !== 'string' || !/^2\./.test(pairVersion)) throw makeError('INVALID_ARGS', 'OpenCode V2 server required.');
+        if (state.url !== paired.origin || state.username !== DEFAULT_USERNAME) {
+          pairCandidate.directory = '';
+          pairCandidate.selected = null;
+          pairCandidate.lastSessionID = null;
+          pairCandidate.nicknames = {};
+          pairCandidate.mode = 'default_chat';
+        }
+        pairCandidate.version = pairVersion;
+        await save(pairCandidate);
+        refresh();
+        return status(pairCandidate);
       }
 
       if (type === 'disconnect') {

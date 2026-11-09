@@ -70,7 +70,12 @@ Manifest confirmation flags distinguish actions: sending is non-destructive and 
 
 ## Server setup and security
 
-Requires OpenCode V2 and its direct Basic-auth JSON API; OpenCode V1 is unsupported. Configure one server URL and password in plugin settings. Password is stored in `secureStorage`; status never reveals credentials. Use the actual shared OpenCode service when you want its existing TUI sessions. Check its address with `opencode service status`.
+Requires OpenCode V2 and its direct Basic-auth JSON API; OpenCode V1 is unsupported. Plugin settings offer two connection methods:
+
+- **Password.** Enter the phone-reachable server URL, username, and password.
+- **Pairing link.** Run `opencode pair` on the server, copy the printed `/auth/connect/<code>` link, and paste it into settings. Do not open the link in a browser first. The link is single-use and expires after 5 minutes. The plugin exchanges it for a session token and stores that token in `secureStorage`; it then uses the token as the Basic-auth password with username `opencode`.
+
+Pairing tokens last 30 days. Changing the server password signs paired sessions out. The server URL must be reachable from the phone; use `opencode pair --remote` or a LAN address instead of a desktop localhost URL. The settings page shows whether the active connection uses Password or Pairing link. Status never reveals the password or pairing token. Use the actual shared OpenCode service when you want its existing TUI sessions. Check its address with `opencode service status`.
 
 OpenCode V2 uses `OPENCODE_PASSWORD` for server authentication; Basic-auth username is always `opencode`. To run a separate server, for example:
 
@@ -95,7 +100,7 @@ npm run build
 Build writes `build/pebble-opencode.pbw`. Install:
 
 1. Sideload PBW in Pebble mobile app; enable plugins if required and grant network permissions.
-2. Open plugin settings; enter phone-reachable server URL and password.
+2. Open plugin settings and connect with either a phone-reachable server URL and password, or a pasted `opencode pair` link.
 3. Choose existing-session mode and select a default, or save an absolute server directory and choose new-session mode.
 4. Use Index to send.
 
@@ -103,4 +108,4 @@ Build writes `build/pebble-opencode.pbw`. Install:
 
 Sources refresh by polling; there is no background listener or SSE. No permission-approval controls are provided. Transport uncertainty is not retried automatically.
 
-Unit and fixture tests cover reply text/streaming and all job kinds. Isolated OpenCode 2.2.1 checks verified explicit question answers and settled-question rejection, idle interruption, and the native empty-message envelope; the jobs endpoint returned 404, so live background-job display is unverified. These checks did not invoke provider/model prompt execution. Prior queue and settings checks remain valid; version 0.2.1 was installed on phone, but 0.3.0 and its new sources/actions have not been tested on a physical phone or watch.
+Unit and fixture tests cover reply text/streaming and all job kinds. Isolated OpenCode 2.2.1 checks verified explicit question answers and settled-question rejection, idle interruption, and the native empty-message envelope; the jobs endpoint returned 404, so live background-job display is unverified. These checks did not invoke provider/model prompt execution. Prior queue and settings checks remain valid. Version 0.5.0 was published to the app store, but 0.6.0 and the pairing-link flow have not been tested on a physical phone or watch.
