@@ -27,11 +27,34 @@ test('manifest and source/action declarations match public contract', () => {
   assert.deepEqual(action.parameters.required, ['message']);
   assert.equal(action.parameters.properties.message.maxLength, 16000);
   assert.deepEqual(action.parameters.properties.chat_id.type, ['string', 'null']);
+  assert.equal(action.parameters.properties.delivery.type, 'string');
+  assert.deepEqual(action.parameters.properties.delivery.enum, ['queue', 'steer']);
+  assert.equal(typeof action.parameters.properties.delivery.description, 'string');
+  assert.equal(Object.prototype.hasOwnProperty.call(action.parameters.properties.delivery, 'default'), false);
+  assert.equal(action.parameters.additionalProperties, false);
 });
 
 test('status has exact public shape and omits secret', async () => {
   const h = harness();
-  assert.deepEqual(await h.service.config({ type: 'status' }), { connected: false, configured: false, url: '', username: 'opencode', version: '', mode: 'default_chat', directory: '', selected: null, nicknames: {} });
+  assert.deepEqual(await h.service.config({ type: 'status' }), { connected: false, configured: false, url: '', username: 'opencode', version: '', mode: 'default_chat', directory: '', selected: null, nicknames: {}, reply_count: 10, default_delivery: 'queue' });
+});
+
+test('reply_count defaults to 10, accepts only integers 1..20, and persists without network', async () => {
+  const h = harness();
+  assert.equal((await h.service.config({ type: 'status' })).reply_count, 10);
+  for (const count of [1, 3, 20]) {
+    assert.equal((await h.service.config({ type: 'reply_count', count })).reply_count, count);
+    assert.equal(h.requests.length, 0);
+  }
+  assert.equal(JSON.parse(h.storage.values.get('opencode.plugin.state.v1')).reply_count, 20);
+  const { createService } = require('../src/plugin/index.js');
+  const next = createService({ storage: h.storage, fetch: async () => response(null) });
+  assert.equal((await next.config({ type: 'status' })).reply_count, 20);
+  for (const count of [0, 21, -1, 1.5, '3', null, true, undefined, NaN]) {
+    await assert.rejects(h.service.config({ type: 'reply_count', count }), error => error.code === 'INVALID_ARGS');
+  }
+  assert.equal((await h.service.config({ type: 'status' })).reply_count, 20);
+  assert.equal(h.requests.length, 0);
 });
 
 test('connect requires password and verifies server before saving', async () => {
@@ -209,7 +232,7 @@ test('direct ID send, returns queued receipt description and does not include mo
   const h = harness(); await connected(h); addPrompt(h, 'ses_a', 'Alpha');
   const result = await h.service.action({ action: 'send_to_agent', args: { message: 'hello', chat_id: 'ses_a' } });
   assert.match(result.text, /Alpha/);
-  assert.deepEqual(result.refreshed, ['agent/chats', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/question', 'opencode/job']);
+  assert.deepEqual(result.refreshed, ['agent/chats', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/question', 'opencode/job']);
   assert.equal(h.requests.filter(req => req.method === 'POST' && req.path.endsWith('/prompt')).length, 1);
   assert.deepEqual(h.requests.find(req => req.path.endsWith('/prompt')).body, { id: h.requests.find(req => req.path.endsWith('/prompt')).body.id, text: 'hello', delivery: 'queue' });
   assert.match(h.requests.find(req => req.path.endsWith('/prompt')).body.id, /^msg_/);

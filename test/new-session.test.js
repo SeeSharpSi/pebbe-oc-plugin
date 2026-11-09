@@ -144,5 +144,5 @@ test('selected virtual ID creates one session and queues one prompt with all sou
   assert.deepEqual(h.requests.filter(req => req.method === 'POST').map(req => req.path), ['/api/session', '/api/session/ses_created/prompt']);
   assert.deepEqual(h.requests.find(req => req.method === 'POST' && req.path === '/api/session').body,
     { title: 'Pebble', location: { directory: '/workspace' } });
-  assert.deepEqual(result.refreshed, ['agent/chats', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/question', 'opencode/job']);
+  assert.deepEqual(result.refreshed, ['agent/chats', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/question', 'opencode/job']);
 });

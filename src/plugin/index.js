@@ -6,6 +6,10 @@
   var DEFAULT_TITLE = 'New session';
   var PAGE_LIMIT = 50;
   var MAX_PAGES = 50;
+  var DEFAULT_REPLY_COUNT = 10;
+  var MAX_REPLY_COUNT = 20;
+  var DELIVERY_MODES = ['queue', 'steer'];
+  var DEFAULT_DELIVERY = 'queue';
   var requestCounter = 0;
 
   function makeError(code, message, httpStatus) {
@@ -101,8 +105,13 @@
   function emptyState() {
     return {
       url: '', username: DEFAULT_USERNAME, password: '', version: '', mode: 'default_chat',
-      directory: '', selected: null, lastSessionID: null, nicknames: {}
+      directory: '', selected: null, lastSessionID: null, nicknames: {}, reply_count: DEFAULT_REPLY_COUNT,
+      default_delivery: DEFAULT_DELIVERY
     };
+  }
+
+  function validDelivery(value) {
+    return DELIVERY_MODES.indexOf(value) !== -1;
   }
 
   function createService(options) {
@@ -127,6 +136,10 @@
           if (stored && stored[key] !== undefined) state[key] = stored[key];
         });
         if (!state.nicknames || typeof state.nicknames !== 'object' || Array.isArray(state.nicknames)) state.nicknames = {};
+        if (!Number.isInteger(state.reply_count) || state.reply_count < 1 || state.reply_count > MAX_REPLY_COUNT) {
+          state.reply_count = DEFAULT_REPLY_COUNT;
+        }
+        if (!validDelivery(state.default_delivery)) state.default_delivery = DEFAULT_DELIVERY;
         return state;
       } catch (_) { return emptyState(); }
     }
@@ -138,7 +151,7 @@
 
     function refresh() {
       if (root.Pebble && typeof root.Pebble.refreshSources === 'function') {
-        try { root.Pebble.refreshSources(['agent/chats', 'agent/configured', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/question', 'opencode/job']); } catch (_) {}
+        try { root.Pebble.refreshSources(['agent/chats', 'agent/configured', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/question', 'opencode/job']); } catch (_) {}
       }
     }
 
@@ -152,7 +165,8 @@
         connected: !!(state.url && state.password && state.version),
         configured: configured(state), url: state.url || '', username: state.username || DEFAULT_USERNAME,
         version: state.version || '', mode: state.mode || 'default_chat', directory: state.directory || '',
-        selected: state.selected || null, nicknames: state.nicknames || {}
+        selected: state.selected || null, nicknames: state.nicknames || {},
+        reply_count: state.reply_count, default_delivery: state.default_delivery || DEFAULT_DELIVERY
       };
     }
 
@@ -498,45 +512,132 @@
       return typeof value === 'string' && value.length > 0 && value.length <= (max || 200) && !/[\u0000-\u001f\u007f]/.test(value);
     }
 
+    async function latestAssistantReply(state, id) {
+      var response = await api(state, sessionPath(id) + '/message?type=assistant&order=desc&limit=20');
+      if (!response || !Array.isArray(response.data) || response.data.length > 20 || !response.cursor || typeof response.cursor !== 'object') {
+        throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid assistant messages.');
+      }
+      var chosen = null;
+      var chosenText = '';
+      response.data.forEach(function (message) {
+        if (!message || message.type !== 'assistant' || !nonemptyID(message.id, 200) ||
+            (message.sessionID !== undefined && message.sessionID !== id) || !message.time || typeof message.time !== 'object' ||
+            typeof message.time.created !== 'number' || !Number.isFinite(message.time.created) || message.time.created < 0 ||
+            (message.time.completed !== undefined && (typeof message.time.completed !== 'number' || !Number.isFinite(message.time.completed) || message.time.completed < 0)) ||
+            !Array.isArray(message.content)) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid assistant messages.');
+        var text = '';
+        message.content.forEach(function (part) {
+          if (!isPlainObject(part) || ['text', 'reasoning', 'tool'].indexOf(part.type) === -1) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid assistant messages.');
+          if (part.type === 'text') {
+            if (typeof part.text !== 'string') throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid assistant messages.');
+            text += part.text;
+          }
+        });
+        if (!chosen && text) { chosen = message; chosenText = text; }
+      });
+      if (!chosen) return null;
+      return { message: chosen, text: chosenText };
+    }
+
+    function replyStatus(message) {
+      var failed = !!message.error || message.finish === 'error';
+      var complete = typeof message.time.completed === 'number';
+      return failed ? 'Error' : complete ? 'Done' : 'Writing';
+    }
+
     function replyInstances(state, id) {
       return getSession(state, id).then(async function (session) {
-        var response = await api(state, sessionPath(id) + '/message?type=assistant&order=desc&limit=20');
-        if (!response || !Array.isArray(response.data) || response.data.length > 20 || !response.cursor || typeof response.cursor !== 'object') {
-          throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid assistant messages.');
-        }
-        var chosen = null;
-        var chosenText = '';
-        response.data.forEach(function (message) {
-          if (!message || message.type !== 'assistant' || !nonemptyID(message.id, 200) ||
-              (message.sessionID !== undefined && message.sessionID !== id) || !message.time || typeof message.time !== 'object' ||
-              typeof message.time.created !== 'number' || !Number.isFinite(message.time.created) || message.time.created < 0 ||
-              (message.time.completed !== undefined && (typeof message.time.completed !== 'number' || !Number.isFinite(message.time.completed) || message.time.completed < 0)) ||
-              !Array.isArray(message.content)) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid assistant messages.');
-          var text = '';
-          message.content.forEach(function (part) {
-            if (!isPlainObject(part) || ['text', 'reasoning', 'tool'].indexOf(part.type) === -1) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid assistant messages.');
-            if (part.type === 'text') {
-              if (typeof part.text !== 'string') throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid assistant messages.');
-              text += part.text;
-            }
-          });
-          if (!chosen && text) { chosen = message; chosenText = text; }
-        });
-        if (!chosen) return [];
+        var reply = await latestAssistantReply(state, id);
+        if (!reply) return [];
+        var chosen = reply.message;
         var title = state.nicknames[id] || (state.selected && state.selected.session_id === id && state.selected.title) || titleOf(session);
-        var failed = !!chosen.error || chosen.finish === 'error';
         var complete = typeof chosen.time.completed === 'number';
         var updated = complete ? chosen.time.completed : chosen.time.created;
         return [{ instanceId: id, properties: {
           name: { shortText: { text: unicodePrefix(title, 7) }, longText: { text: title } },
           session_id: { longText: { text: id } }, message_id: { longText: { text: chosen.id } },
-          text: { shortText: { text: unicodePrefix(chosenText, 7) }, longText: { text: unicodePrefix(chosenText, 4096) } },
+          text: { shortText: { text: unicodePrefix(reply.text, 7) }, longText: { text: unicodePrefix(reply.text, 4096) } },
           updated: { timestamp: { value: Math.floor(updated / 1000) } },
           complete: { boolean: { value: complete } },
-          status: { shortText: { text: failed ? 'Error' : complete ? 'Done' : 'Writing' }, longText: { text: failed ? 'Error' : complete ? 'Done' : 'Writing' } },
+          status: { shortText: { text: replyStatus(chosen) }, longText: { text: replyStatus(chosen) } },
           url: { longText: { text: sessionURL(state.url, id) } }
         }}];
       });
+    }
+
+    function repliesInstance(state, meta, reply, defaultID) {
+      var name = meta.nickname || meta.title;
+      var properties = {
+        name: { shortText: { text: unicodePrefix(name, 7) }, longText: { text: name } },
+        title: { longText: { text: meta.title } },
+        session_id: { longText: { text: meta.session_id } },
+        is_default: { boolean: { value: meta.session_id === defaultID } },
+        url: { longText: { text: meta.url } }
+      };
+      if (reply) {
+        var complete = typeof reply.message.time.completed === 'number';
+        var updated = complete ? reply.message.time.completed : reply.message.time.created;
+        var statusText = replyStatus(reply.message);
+        properties.message_id = { longText: { text: reply.message.id } };
+        properties.text = { shortText: { text: unicodePrefix(reply.text, 7) }, longText: { text: unicodePrefix(reply.text, 4096) } };
+        properties.updated = { timestamp: { value: Math.floor(updated / 1000) } };
+        properties.complete = { boolean: { value: complete } };
+        properties.status = { shortText: { text: statusText }, longText: { text: statusText } };
+      } else {
+        properties.status = { shortText: { text: 'Idle' }, longText: { text: 'No reply' } };
+      }
+      return { instanceId: meta.session_id, properties: properties };
+    }
+
+    async function repliesInstances(state) {
+      var page = await chatRows(state, null);
+      var recent = page.sessions;
+      var byID = Object.create(null);
+      recent.forEach(function (row) {
+        if (!byID[row.session_id]) byID[row.session_id] = row;
+      });
+      var defaultID = state.mode === 'default_chat' && state.selected && sessionID(state.selected.session_id) ? state.selected.session_id : null;
+      var lastID = sessionID(state.lastSessionID) ? state.lastSessionID : null;
+      var ordered = [];
+      var seenIDs = Object.create(null);
+      function addFocus(id) {
+        if (!id || seenIDs[id]) return;
+        seenIDs[id] = true;
+        ordered.push(byID[id] ? { meta: byID[id] } : { id: id });
+      }
+      addFocus(defaultID);
+      addFocus(lastID);
+      recent.forEach(function (row) {
+        if (seenIDs[row.session_id]) return;
+        seenIDs[row.session_id] = true;
+        ordered.push({ meta: row });
+      });
+      ordered = ordered.slice(0, state.reply_count);
+
+      var limit = createLimiter(4);
+      var instances;
+      try {
+        instances = await Promise.all(ordered.map(function (entry) {
+          return limit(async function () {
+            var meta = entry.meta;
+            if (!meta) {
+              var session = await getSession(state, entry.id);
+              meta = {
+                session_id: session.id,
+                title: titleOf(session),
+                nickname: state.nicknames[session.id] || '',
+                url: sessionURL(state.url, session.id)
+              };
+            }
+            var reply = await latestAssistantReply(state, meta.session_id);
+            return repliesInstance(state, meta, reply, defaultID);
+          });
+        }));
+      } catch (err) {
+        limit.stop(err);
+        throw err;
+      }
+      return { validUntilMs: now() + 60000, instances: instances };
     }
 
     async function jobInstances(state) {
@@ -795,6 +896,23 @@
         return status(state);
       }
 
+      if (type === 'reply_count') {
+        if (!Number.isInteger(input.count) || input.count < 1 || input.count > MAX_REPLY_COUNT) {
+          throw makeError('INVALID_ARGS', 'Reply session count must be a whole number from 1 to 20.');
+        }
+        state.reply_count = input.count;
+        await save(state);
+        refresh();
+        return status(state);
+      }
+
+      if (type === 'default_delivery') {
+        if (!validDelivery(input.delivery)) throw makeError('INVALID_ARGS', 'Delivery must be queue or steer.');
+        state.default_delivery = input.delivery;
+        await save(state);
+        return status(state);
+      }
+
       if (type === 'directory') {
         if (!directoryPath(input.directory)) throw makeError('INVALID_ARGS', 'Directory must be an absolute server path.');
         state.directory = input.directory;
@@ -909,6 +1027,10 @@
           (sessionID(state.lastSessionID) ? state.lastSessionID : null);
         return { validUntilMs: now() + 20000, instances: replyID ? await replyInstances(state, replyID) : [] };
       }
+      if (input.category === 'opencode' && input.item === 'replies') {
+        requireConnection(state);
+        return await repliesInstances(state);
+      }
       if (input.category === 'opencode' && input.item === 'job') {
         requireConnection(state);
         return { validUntilMs: now() + 20000, instances: await jobInstances(state) };
@@ -936,30 +1058,37 @@
       return 'msg_' + fallback.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 100);
     }
 
-    function validReceipt(message, id, text) {
+    function validReceipt(message, id, text, delivery) {
+      return !!(message && message.id === id && message.sessionID === text.sessionID &&
+        message.type === 'user' && message.payload && message.payload.text === text.text &&
+        (delivery === undefined || message.delivery === delivery));
+    }
+
+    function receiptShape(message, id, text) {
       return !!(message && message.id === id && message.sessionID === text.sessionID &&
         message.type === 'user' && message.payload && message.payload.text === text.text);
     }
 
-    async function verifyDelivery(state, sessionId, messageId, text) {
+    async function verifyDelivery(state, sessionId, messageId, text, delivery) {
       try {
         var direct = await api(state, sessionPath(sessionId) + '/message/' + encodeURIComponent(messageId));
         var directMessage = direct && direct.data;
-        if (directMessage && directMessage.id === messageId && directMessage.type === 'user' && directMessage.text === text) return true;
+        if (directMessage && directMessage.id === messageId && directMessage.type === 'user' && directMessage.text === text &&
+            (directMessage.delivery === undefined || directMessage.delivery === delivery)) return true;
       } catch (_) {}
       try {
         var inbox = await api(state, sessionPath(sessionId) + '/inbox');
         var messages = inbox && inbox.data;
         if (Array.isArray(messages)) {
           for (var i = 0; i < messages.length; i += 1) {
-            if (validReceipt(messages[i], messageId, { sessionID: sessionId, text: text })) return true;
+            if (validReceipt(messages[i], messageId, { sessionID: sessionId, text: text }, delivery)) return true;
           }
         }
       } catch (_) {}
       return false;
     }
 
-    var refreshedActions = ['agent/chats', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/question', 'opencode/job'];
+    var refreshedActions = ['agent/chats', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/question', 'opencode/job'];
 
     async function interruptAction(state, args) {
       if (!isPlainObject(args) || Object.keys(args).length !== 1 || !sessionID(args.session_id)) throw makeError('INVALID_ARGS', 'Invalid session ID.');
@@ -1084,8 +1213,11 @@
       }
       var args = input.args;
       Object.keys(args).forEach(function (key) {
-        if (key !== 'message' && key !== 'chat_id') throw makeError('INVALID_ARGS', 'Unexpected action argument.');
+        if (key !== 'message' && key !== 'chat_id' && key !== 'delivery') throw makeError('INVALID_ARGS', 'Unexpected action argument.');
       });
+      if (args.delivery !== undefined && !validDelivery(args.delivery)) {
+        throw makeError('INVALID_ARGS', 'Delivery must be queue or steer.');
+      }
       var message = args.message;
       if (typeof message !== 'string' || !message.trim() || message.length > 16000 ||
           (args.chat_id !== undefined && args.chat_id !== null && typeof args.chat_id !== 'string')) {
@@ -1093,6 +1225,7 @@
       }
       var state = await load();
       requireConnection(state);
+      var delivery = args.delivery === undefined ? state.default_delivery : args.delivery;
       var target = args.chat_id === undefined || args.chat_id === null || args.chat_id.trim() === '' ? null : args.chat_id.trim();
       if (target === null) {
         if (state.mode === 'new_chat') target = 'new';
@@ -1138,26 +1271,29 @@
       var messageID = makeMessageID();
       var receipt;
       var deliveryVerified = false;
+      var receiptText = { sessionID: session.id, text: message };
       try {
         receipt = await api(state, sessionPath(session.id) + '/prompt', 'POST', {
-          id: messageID, text: message, delivery: 'queue'
+          id: messageID, text: message, delivery: delivery
         });
       } catch (sendError) {
         if (sendError && (sendError.code === 'PERMISSION_DENIED' || sendError.code === 'AUTH_REQUIRED' || sendError.code === 'RATE_LIMITED')) throw sendError;
         if (sendError && sendError.httpStatus && sendError.httpStatus < 500 && sendError.httpStatus !== 409) throw sendError;
         if (sendError && sendError.httpStatus === 409) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode reported a conflict; inspect desktop before retrying.');
-        if (!await verifyDelivery(state, session.id, messageID, message)) {
+        if (!await verifyDelivery(state, session.id, messageID, message, delivery)) {
           throw makeError('PLUGIN_UNAVAILABLE', 'Delivery uncertain. Inspect OpenCode desktop before retrying.');
         }
         deliveryVerified = true;
         receipt = null;
       }
       var result = receipt && receipt.data;
-      if (receipt && validReceipt(result, messageID, { sessionID: session.id, text: message })) {
+      if (receipt && validReceipt(result, messageID, receiptText, delivery)) {
         deliveryVerified = true;
+      } else if (receipt && receiptShape(result, messageID, receiptText)) {
+        throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode accepted the message with a different delivery mode. Inspect desktop before retrying.');
       }
       if (!deliveryVerified) {
-        if (!await verifyDelivery(state, session.id, messageID, message)) {
+        if (!await verifyDelivery(state, session.id, messageID, message, delivery)) {
           throw makeError('PLUGIN_UNAVAILABLE', 'Delivery uncertain. Inspect OpenCode desktop before retrying.');
         }
         deliveryVerified = true;
@@ -1173,7 +1309,7 @@
         }
       } catch (_) { focusWarning = true; }
       return {
-        text: 'Message submitted to OpenCode: ' + titleOf(session) + (focusWarning ? ' Focus not saved.' : ''),
+        text: (delivery === 'steer' ? 'Message steered into OpenCode: ' : 'Message queued for OpenCode: ') + titleOf(session) + (focusWarning ? ' Focus not saved.' : ''),
         refreshed: refreshedActions
       };
     }

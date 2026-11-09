@@ -1,7 +1,7 @@
 {
   "name": "pebble-opencode",
   "author": "OpenCode for Pebble contributors",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "private": true,
   "scripts": {
     "test": "node --test test/*.test.js",
@@ -172,6 +172,50 @@
         {
           "category": "opencode",
           "items": [
+            "replies"
+          ],
+          "properties": {
+            "name": [
+              "shortText",
+              "longText"
+            ],
+            "title": [
+              "longText"
+            ],
+            "session_id": [
+              "longText"
+            ],
+            "message_id": [
+              "longText"
+            ],
+            "text": [
+              "shortText",
+              "longText"
+            ],
+            "updated": [
+              "timestamp"
+            ],
+            "complete": [
+              "boolean"
+            ],
+            "status": [
+              "shortText",
+              "longText"
+            ],
+            "is_default": [
+              "boolean"
+            ],
+            "url": [
+              "longText"
+            ]
+          },
+          "supportsMultiple": true,
+          "callerPermissions": [],
+          "suggestedRefreshIntervalSec": 60
+        },
+        {
+          "category": "opencode",
+          "items": [
             "question"
           ],
           "properties": {
@@ -243,7 +287,7 @@
       "actions": [
         {
           "name": "send_to_agent",
-          "description": "Send a message to an existing OpenCode session or start a new session in a directory. chat_id may identify a session by its ID, nickname, or unambiguous title; use \"new\" to start a session in the configured directory. Omit chat_id to follow settings: use the configured default session or start a new one. Returns a queued receipt, not OpenCode's reply. Do not automatically retry uncertain delivery or conflicts.",
+          "description": "Send a message to an existing OpenCode session or start a new session in a directory. chat_id may identify a session by its ID, nickname, or unambiguous title; use \"new\" to start a session in the configured directory. Omit chat_id to follow settings: use the configured default session or start a new one. The optional delivery parameter queues the message until the current run finishes or steers it into the active run; omit it to use the plugin default. Returns a receipt for the requested delivery mode, not OpenCode's reply. Do not automatically retry uncertain delivery or conflicts.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -259,6 +303,14 @@
                   "null"
                 ],
                 "description": "Session ID, nickname, or unambiguous title. Use \"new\" to start a session in the configured directory; omit to follow settings."
+              },
+              "delivery": {
+                "type": "string",
+                "enum": [
+                  "queue",
+                  "steer"
+                ],
+                "description": "queue waits for the current run; steer injects at the next safe turn. Omit to use the plugin setting; initial default queue."
               }
             },
             "required": [
@@ -293,7 +345,8 @@
           "targets": [
             "opencode/active_session",
             "agent/chats",
-            "opencode/reply"
+            "opencode/reply",
+            "opencode/replies"
           ],
           "destructive": true,
           "requiresConfirmation": true,

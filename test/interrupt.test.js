@@ -27,7 +27,7 @@ function call(h, args) { return h.service.action({ action: 'interrupt_session', 
 test('interrupt manifest declares exact destructive confirmation contract', () => {
   const action = manifest.plugin.actions.find(item => item.name === 'interrupt_session');
   assert.ok(action);
-  assert.deepEqual(action.targets, ['opencode/active_session', 'agent/chats', 'opencode/reply']);
+  assert.deepEqual(action.targets, ['opencode/active_session', 'agent/chats', 'opencode/reply', 'opencode/replies']);
   assert.equal(action.destructive, true);
   assert.equal(action.requiresConfirmation, true);
   assert.deepEqual(action.parameters.required, ['session_id']);
@@ -58,7 +58,7 @@ test('interrupt validates live matching unarchived session before one bodyless P
   });
   const result = await call(h, { session_id: 'ses_live' });
   assert.match(result.text, /interrupted/i);
-  assert.deepEqual(result.refreshed, ['agent/chats', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/question', 'opencode/job']);
+  assert.deepEqual(result.refreshed, ['agent/chats', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/question', 'opencode/job']);
   assert.deepEqual(h.requests.map(req => [req.method, req.path]), [
     ['GET', '/api/session/ses_live'], ['POST', '/api/session/ses_live/interrupt']
   ]);

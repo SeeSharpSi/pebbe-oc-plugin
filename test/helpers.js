@@ -42,16 +42,16 @@ function session(id, title = 'Pebble', extra = {}) {
   return { id, title, location: { directory: '/workspace' }, time: { created: 1700000000, updated: 1700000001 }, cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }, projectID: 'project-1', ...extra };
 }
 function page(rows, next = null, previous = null) { return { data: rows, cursor: { previous, next } }; }
-function makeAck(id, msgId, text) { return { data: { id: msgId, sessionID: id, type: 'user', payload: { text }, delivery: 'queue', time: { created: 1700000000 } } }; }
+function makeAck(id, msgId, text, delivery = 'queue') { return { data: { id: msgId, sessionID: id, type: 'user', payload: { text }, delivery, time: { created: 1700000000 } } }; }
 function addConnect(h, result = response({ version: '2.2.1' }), params = {}) {
   h.route('GET', '/api/info', result);
   return h.service.config({ type: 'connect', url: 'http://localhost:4096', username: 'opencode', password: 'pässword', ...params });
 }
 async function connected(h) { const result = await addConnect(h); if (result && result.error) throw Error(result.error.message); return result; }
 function addLiveSession(h, id, s = session(id)) { h.route('GET', `/api/session/${id}`, response({ data: s })); }
-function addPrompt(h, id, title, text = 'hello') {
+function addPrompt(h, id, title, text = 'hello', delivery = 'queue') {
   addLiveSession(h, id, session(id, title));
-  h.route('POST', `/api/session/${id}/prompt`, req => response(makeAck(id, req.body.id, text)));
+  h.route('POST', `/api/session/${id}/prompt`, req => response(makeAck(id, req.body.id, text, delivery)));
 }
 
 module.exports = { MemoryStorage, response, harness, session, page, makeAck, addConnect, connected, addLiveSession, addPrompt };

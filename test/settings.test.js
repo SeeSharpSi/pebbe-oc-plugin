@@ -59,18 +59,25 @@ function setup(initialState) {
       if (target !== 'plugin') throw new Error(`Unexpected message target ${target}`);
       switch (message.type) {
         case 'status':
-          return { connected: true, configured: state.mode === 'new_chat' ? Boolean(state.directory) : Boolean(state.selected), url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames } };
+          return { connected: true, configured: state.mode === 'new_chat' ? Boolean(state.directory) : Boolean(state.selected), url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames }, reply_count: state.reply_count || 10, default_delivery: state.default_delivery || 'queue' };
         case 'mode':
           state.mode = message.mode;
-          return { connected: true, configured: state.mode === 'new_chat' ? Boolean(state.directory) : Boolean(state.selected), url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames } };
+          return { connected: true, configured: state.mode === 'new_chat' ? Boolean(state.directory) : Boolean(state.selected), url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames }, reply_count: state.reply_count || 10, default_delivery: state.default_delivery || 'queue' };
         case 'list':
           return { sessions: listRows.map(row => ({ ...row })), next_cursor: null };
         case 'select':
           state.selected = { session_id: message.session_id, title: listRows.find(row => row.session_id === message.session_id).title };
-          return { connected: true, configured: true, url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames } };
+          return { connected: true, configured: true, url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames }, reply_count: state.reply_count || 10, default_delivery: state.default_delivery || 'queue' };
         case 'directory':
           state.directory = message.directory;
-          return { connected: true, configured: state.mode === 'new_chat' ? Boolean(state.directory) : Boolean(state.selected), url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames } };
+          return { connected: true, configured: state.mode === 'new_chat' ? Boolean(state.directory) : Boolean(state.selected), url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames }, reply_count: state.reply_count || 10, default_delivery: state.default_delivery || 'queue' };
+        case 'reply_count':
+          state.reply_count = message.count;
+          return { connected: true, configured: state.mode === 'new_chat' ? Boolean(state.directory) : Boolean(state.selected), url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames }, reply_count: state.reply_count, default_delivery: state.default_delivery || 'queue' };
+        case 'default_delivery':
+          if (message.delivery !== 'queue' && message.delivery !== 'steer') throw new Error('Invalid delivery.');
+          state.default_delivery = message.delivery;
+          return { connected: true, configured: state.mode === 'new_chat' ? Boolean(state.directory) : Boolean(state.selected), url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames }, reply_count: state.reply_count || 10, default_delivery: state.default_delivery };
         default:
           throw new Error(`Unexpected plugin message: ${message.type}`);
       }
@@ -95,6 +102,25 @@ function setup(initialState) {
 function initialNewModeState() {
   return { mode: 'new_chat', directory: '/saved/path', selected: null, nicknames: { ses_saved: 'Pinned' } };
 }
+
+test('delivery setting defaults to queue, saves exact steer message, updates select, and needs no list fetch', async () => {
+  const ui = setup(initialNewModeState());
+  await ui.fireReady('plugin');
+  assert.equal(ui.document.getElementById('defaultDelivery').value, 'queue');
+  assert.equal(ui.calls.some(call => call.message.type === 'list'), false);
+  ui.document.getElementById('defaultDelivery').value = 'steer';
+  await ui.click('saveDelivery');
+  const saved = ui.calls.find(call => call.message.type === 'default_delivery');
+  assert.deepEqual(saved.message, { type: 'default_delivery', delivery: 'steer' });
+  assert.equal(ui.state.default_delivery, 'steer');
+  assert.equal(ui.document.getElementById('defaultDelivery').value, 'steer');
+  assert.match(ui.document.getElementById('feedback').textContent, /saved/i);
+  assert.equal(ui.calls.some(call => call.message.type === 'list'), false);
+
+  const refreshed = setup({ ...initialNewModeState(), default_delivery: 'steer' });
+  await refreshed.fireReady('plugin');
+  assert.equal(refreshed.document.getElementById('defaultDelivery').value, 'steer');
+});
 
 test('ready plugin keeps recent-session panel hidden in new mode and avoids list fetch', async () => {
   const ui = setup(initialNewModeState());
@@ -123,6 +149,29 @@ test('switching modes loads existing rows once, uses real default, and preserves
   assert.equal(ui.state.nicknames.ses_saved, 'Pinned');
   assert.equal(ui.calls.filter(call => call.message.type === 'list').length, 1, 'cached real rows should prevent redundant retrieval');
   assert.equal(ui.calls.filter(call => call.message.type === 'select').length, 1);
+});
+
+test('reply count initializes to 10, saves an exact integer, and rejects invalid values without a message', async () => {
+  const ui = setup(initialNewModeState());
+  await ui.fireReady('plugin');
+  assert.deepEqual(ui.calls.map(call => call.message.type), ['status']);
+  assert.equal(ui.document.getElementById('replyCount').value, '10');
+  assert.equal(ui.state.reply_count, undefined);
+
+  ui.document.getElementById('replyCount').value = '3';
+  await ui.click('saveReplyCount');
+  const saved = ui.calls.find(call => call.message.type === 'reply_count');
+  assert.deepEqual(saved.message, { type: 'reply_count', count: 3 });
+  assert.equal(ui.state.reply_count, 3);
+  assert.equal(ui.document.getElementById('replyCount').value, '3');
+  assert.match(ui.document.getElementById('feedback').textContent, /saved/i);
+
+  const before = ui.calls.filter(call => call.message.type === 'reply_count').length;
+  ui.document.getElementById('replyCount').value = '21';
+  await ui.click('saveReplyCount');
+  assert.equal(ui.calls.filter(call => call.message.type === 'reply_count').length, before);
+  assert.match(ui.document.getElementById('feedback').textContent, /1 to 20/i);
+  assert.equal(ui.state.reply_count, 3);
 });
 
 test('new-mode banner uses saved directory until typed draft is saved', async () => {
