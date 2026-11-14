@@ -30,7 +30,9 @@ test('manifest appends activity sources without changing agent source declaratio
     properties: {
       name: ['shortText', 'longText'], title: ['longText'], status: ['shortText', 'longText'],
       directory: ['longText'], agent: ['longText'], model: ['longText'], updated: ['timestamp'],
-      url: ['longText'], is_subagent: ['boolean']
+      url: ['longText'], is_subagent: ['boolean'], outcome: ['shortText', 'longText'], cost: ['numericValue', 'shortText'],
+      tokens_input: ['numericValue'], tokens_output: ['numericValue'], tokens_reasoning: ['numericValue'],
+      tokens_cache_read: ['numericValue'], tokens_cache_write: ['numericValue']
     }, supportsMultiple: true, callerPermissions: [], suggestedRefreshIntervalSec: 20
   });
   assert.deepEqual(sources[3], {
@@ -104,6 +106,7 @@ test('permuted multi-level lineages keep ancestry order stable across metadata c
   };
   configureScan(['Root one', 'Child one', 'Grand one', 'Other one'], 1);
   const first = await source(h);
+  h.setNow(1700000006000);
   configureScan(['Root two', 'Child two', 'Grand two', 'Other two'], 2000);
   const second = await source(h);
   assert.deepEqual(first.instances.map(item => item.instanceId), ['ses_root', 'ses_zchild', 'ses_grand', 'ses_unrelated']);
@@ -379,8 +382,20 @@ test('active ID and metadata limits fail closed', async t => {
   });
 });
 
-test('each source call rescans active API without cross-request cache', async () => {
+test('shared persistent active snapshot cache expires after five seconds', async () => {
   const h = harness(); await ready(h); addActive(h, {}); await source(h);
+  const recreated = require('../src/plugin/index.js').createService({ storage: h.storage, fetch: async (url, options) => {
+    const parsed = new URL(url);
+    const req = { path: parsed.pathname, method: options.method || 'GET' };
+    h.requests.push(req);
+    const routeIndex = h.routes.findIndex(route => route.method === req.method && route.match(req));
+    if (routeIndex < 0) { h.unexpected.push(`Unexpected request: ${req.method} ${req.path}`); throw new Error('unexpected'); }
+    const [route] = h.routes.splice(routeIndex, 1);
+    return typeof route.result === 'function' ? route.result(req) : route.result;
+  }, now: () => 1700000000000 });
+  assert.equal((await recreated.source({ category: 'opencode', item: 'active_session' })).instances.length, 0);
+  assert.equal(h.requests.filter(req => req.path === '/api/session/active').length, 1);
+  h.setNow(1700000006000);
   addActive(h, activeMap('ses_new')); addMetadata(h, 'ses_new'); addPending(h, 'ses_new');
   const second = await source(h);
   assert.equal(second.instances[0].instanceId, 'ses_new');

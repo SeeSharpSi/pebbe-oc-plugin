@@ -53,6 +53,17 @@ test('default delivery is queue, accepts both modes, persists without network, a
   assert.equal((await next.config({ type: 'status' })).default_delivery, 'queue');
 });
 
+test('default delivery configuration does not refresh server sources', async () => {
+  const h = harness();
+  const previous = global.Pebble;
+  const refreshed = [];
+  global.Pebble = { refreshSources: sources => refreshed.push(sources) };
+  try { await h.service.config({ type: 'default_delivery', delivery: 'steer' }); }
+  finally { if (previous === undefined) delete global.Pebble; else global.Pebble = previous; }
+  assert.deepEqual(refreshed, []);
+  assert.equal(h.requests.length, 0);
+});
+
 test('status exposes exact default_delivery field', async () => {
   const h = harness();
   assert.deepEqual(await h.service.config({ type: 'status' }), status({}));
@@ -105,8 +116,15 @@ test('invalid delivery values reject before any prompt request', async () => {
 
 test('receipt with different delivery fails as uncertain without a second prompt', async () => {
   const h = harness(); await connected(h); addPrompt(h, 'ses_a', 'Alpha', 'hello', 'steer');
+  const rawState = h.storage.values.get('opencode.plugin.state.v1');
+  const state = typeof rawState === 'string' ? JSON.parse(rawState) : rawState;
+  const previousGeneration = state.cache_generation;
+  h.storage.values.set('opencode.plugin.cache.v1', { version: 1, generation: previousGeneration, url: state.url, username: state.username, entries: {} });
   await assert.rejects(h.service.action({ action: 'send_to_agent', args: { message: 'hello', chat_id: 'ses_a' } }), error => error.code === 'PLUGIN_UNAVAILABLE');
   assert.equal(prompts(h).length, 1);
+  const finalState = h.storage.values.get('opencode.plugin.state.v1');
+  assert.notEqual((typeof finalState === 'string' ? JSON.parse(finalState) : finalState).cache_generation, previousGeneration);
+  assert.equal(h.storage.values.has('opencode.plugin.cache.v1'), false);
 });
 
 test('transport failure accepts matching steer inbox item', async () => {

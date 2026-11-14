@@ -58,7 +58,7 @@ test('interrupt validates live matching unarchived session before one bodyless P
   });
   const result = await call(h, { session_id: 'ses_live' });
   assert.match(result.text, /interrupted/i);
-  assert.deepEqual(result.refreshed, ['agent/chats', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/chat_status', 'opencode/permission', 'opencode/question', 'opencode/job']);
+  assert.deepEqual(result.refreshed, ['opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/chat_status', 'opencode/permission', 'opencode/question', 'opencode/job', 'opencode/execution', 'opencode/queue', 'opencode/shell']);
   assert.deepEqual(h.requests.map(req => [req.method, req.path]), [
     ['GET', '/api/session/ses_live'], ['POST', '/api/session/ses_live/interrupt']
   ]);

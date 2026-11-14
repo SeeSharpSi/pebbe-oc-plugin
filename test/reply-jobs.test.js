@@ -20,12 +20,22 @@ test.afterEach(() => {
 
 const sessionResponse = id => response({ data: session(id, 'Reply target') });
 const replyPath = id => `/api/session/${id}/message`;
-const addReply = (h, id, messages) => h.route('GET', req => req.path === replyPath(id), req => {
-  assert.equal(req.search.get('type'), 'assistant');
-  assert.equal(req.search.get('order'), 'desc');
-  assert.equal(req.search.get('limit'), '20');
-  return response({ data: messages, cursor: { next: null, previous: null } });
-});
+const addReply = (h, id, messages) => {
+  function routePage() {
+    h.route('GET', req => req.path === replyPath(id), req => {
+      assert.equal(req.search.get('type'), 'assistant');
+      const limit = Number(req.search.get('limit'));
+      assert.ok(limit > 0 && limit <= 5);
+      const offset = req.search.has('cursor') ? Number(req.search.get('cursor')) : 0;
+      assert.equal(req.search.get('order'), offset === 0 ? 'desc' : null);
+      const data = messages.slice(offset, offset + limit);
+      const next = offset + limit < messages.length ? String(offset + limit) : null;
+      if (next !== null) routePage();
+      return response({ data, cursor: { next, previous: null } });
+    });
+  }
+  routePage();
+};
 const source = (h, item) => h.service.source({ category: 'opencode', item });
 
 test('reply requires authentication even when there is no focused session', async () => {
@@ -75,7 +85,7 @@ test('reply reads selected session in default mode and extracts newest assistant
 test('reply new-chat mode focuses last delivered session, not stale selected session', async () => {
   const h = harness({ mode: 'new_chat', selected: { session_id: 'ses_old', title: 'Old' }, lastSessionID: 'ses_new' });
   h.route('GET', '/api/session/ses_new', sessionResponse('ses_new'));
-  addReply(h, 'ses_new', [{ id: 'msg', type: 'assistant', time: { created: 1700000000000 }, content: [{ type: 'text', text: 'new target' }] }]);
+  addReply(h, 'ses_new', [{ id: 'msg_new', type: 'assistant', time: { created: 1700000000000 }, content: [{ type: 'text', text: 'new target' }] }]);
   const result = await source(h, 'reply');
   assert.equal(result.instances[0].instanceId, 'ses_new');
   assert.equal(result.instances[0].properties.text.longText.text, 'new target');
@@ -185,12 +195,14 @@ test('reply clips long Unicode text by code point without splitting surrogate pa
   }
 });
 
-test('reply rejects history over requested limit instead of truncating an invalid response', async () => {
+test('reply inspects newest 20 assistant messages across adaptive pages', async () => {
   const h = harness({ selected: { session_id: 'ses_many', title: 'Many' } });
   h.route('GET', '/api/session/ses_many', sessionResponse('ses_many'));
-  const rows = Array.from({ length: 21 }, (_, index) => ({ id: `msg_${index}`, type: 'assistant', time: { created: 1000 }, content: [{ type: 'text', text: 'answer' }] }));
+  const rows = Array.from({ length: 21 }, (_, index) => ({ id: `msg_${index}`, type: 'assistant', time: { created: 1000 }, content: index === 19 ? [{ type: 'text', text: 'answer' }] : [{ type: 'tool', state: { status: 'completed' } }] }));
   addReply(h, 'ses_many', rows);
-  await assert.rejects(source(h, 'reply'), error => error.code === 'PLUGIN_UNAVAILABLE');
+  const result = await source(h, 'reply');
+  assert.equal(result.instances[0].properties.message_id.longText.text, 'msg_19');
+  assert.equal(h.requests.filter(req => req.path === '/api/session/ses_many/message').length, 4);
 });
 
 test('job source maps supported kinds and statuses, sorts stable IDs, and omits payload secrets', async () => {

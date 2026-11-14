@@ -58,7 +58,9 @@ test('manifest declares chat status, permission source, and attention actions', 
     message_id: ['longText'], needs_action: ['boolean'], reason: ['shortText', 'longText'],
     permission_count: ['numericValue', 'shortText'], question_count: ['numericValue', 'shortText'],
     unread: ['boolean'], updated: ['timestamp'], is_default: ['boolean'],
-    is_subagent: ['boolean'], url: ['longText']
+    is_subagent: ['boolean'], url: ['longText'], outcome: ['shortText', 'longText'], cost: ['numericValue', 'shortText'],
+    tokens_input: ['numericValue'], tokens_output: ['numericValue'], tokens_reasoning: ['numericValue'],
+    tokens_cache_read: ['numericValue'], tokens_cache_write: ['numericValue'], agent: ['longText'], model: ['longText']
   });
   const permissions = sources.find(item => item.items[0] === 'permission');
   assert.ok(permissions);

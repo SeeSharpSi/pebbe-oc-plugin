@@ -1,7 +1,7 @@
 {
   "name": "pebble-opencode",
   "author": "OpenCode for Pebble contributors",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "private": true,
   "scripts": {
     "test": "node --test test/*.test.js",
@@ -17,7 +17,7 @@
       "LocalNetwork"
     ],
     "plugin": {
-      "description": "Send messages; expose OpenCode activity, replies, chat attention, permissions, questions, jobs, and OpenCode Go usage only; interrupt foreground sessions.",
+      "description": "Send messages; expose OpenCode execution, queue, shell, command, activity, replies, chat attention, permissions, questions, jobs, and session metrics; expose OpenCode Go usage only; interrupt foreground sessions.",
       "script": "src/plugin/index.js",
       "sources": [
         {
@@ -92,6 +92,29 @@
             ],
             "is_subagent": [
               "boolean"
+            ],
+            "outcome": [
+              "shortText",
+              "longText"
+            ],
+            "cost": [
+              "numericValue",
+              "shortText"
+            ],
+            "tokens_input": [
+              "numericValue"
+            ],
+            "tokens_output": [
+              "numericValue"
+            ],
+            "tokens_reasoning": [
+              "numericValue"
+            ],
+            "tokens_cache_read": [
+              "numericValue"
+            ],
+            "tokens_cache_write": [
+              "numericValue"
             ]
           },
           "supportsMultiple": true,
@@ -163,6 +186,35 @@
             ],
             "url": [
               "longText"
+            ],
+            "outcome": [
+              "shortText",
+              "longText"
+            ],
+            "cost": [
+              "numericValue",
+              "shortText"
+            ],
+            "tokens_input": [
+              "numericValue"
+            ],
+            "tokens_output": [
+              "numericValue"
+            ],
+            "tokens_reasoning": [
+              "numericValue"
+            ],
+            "tokens_cache_read": [
+              "numericValue"
+            ],
+            "tokens_cache_write": [
+              "numericValue"
+            ],
+            "agent": [
+              "longText"
+            ],
+            "model": [
+              "longText"
             ]
           },
           "supportsMultiple": false,
@@ -206,6 +258,35 @@
               "boolean"
             ],
             "url": [
+              "longText"
+            ],
+            "outcome": [
+              "shortText",
+              "longText"
+            ],
+            "cost": [
+              "numericValue",
+              "shortText"
+            ],
+            "tokens_input": [
+              "numericValue"
+            ],
+            "tokens_output": [
+              "numericValue"
+            ],
+            "tokens_reasoning": [
+              "numericValue"
+            ],
+            "tokens_cache_read": [
+              "numericValue"
+            ],
+            "tokens_cache_write": [
+              "numericValue"
+            ],
+            "agent": [
+              "longText"
+            ],
+            "model": [
               "longText"
             ]
           },
@@ -260,6 +341,35 @@
               "boolean"
             ],
             "url": [
+              "longText"
+            ],
+            "outcome": [
+              "shortText",
+              "longText"
+            ],
+            "cost": [
+              "numericValue",
+              "shortText"
+            ],
+            "tokens_input": [
+              "numericValue"
+            ],
+            "tokens_output": [
+              "numericValue"
+            ],
+            "tokens_reasoning": [
+              "numericValue"
+            ],
+            "tokens_cache_read": [
+              "numericValue"
+            ],
+            "tokens_cache_write": [
+              "numericValue"
+            ],
+            "agent": [
+              "longText"
+            ],
+            "model": [
               "longText"
             ]
           },
@@ -373,6 +483,81 @@
           "supportsMultiple": true,
           "callerPermissions": [],
           "suggestedRefreshIntervalSec": 20
+        },
+        {
+          "category": "opencode",
+          "items": [
+            "execution"
+          ],
+          "properties": {
+            "name": ["shortText", "longText"],
+            "session_id": ["longText"],
+            "status": ["shortText", "longText"],
+            "detail": ["longText"],
+            "tool": ["longText"],
+            "retry_at": ["timestamp"],
+            "updated": ["timestamp"],
+            "url": ["longText"]
+          },
+          "supportsMultiple": false,
+          "callerPermissions": [],
+          "suggestedRefreshIntervalSec": 20
+        },
+        {
+          "category": "opencode",
+          "items": [
+            "queue"
+          ],
+          "properties": {
+            "name": ["shortText", "longText"],
+            "session_id": ["longText"],
+            "inbox_id": ["longText"],
+            "kind": ["shortText"],
+            "text": ["shortText", "longText"],
+            "delivery": ["shortText"],
+            "queued_at": ["timestamp"],
+            "url": ["longText"]
+          },
+          "supportsMultiple": true,
+          "callerPermissions": [],
+          "suggestedRefreshIntervalSec": 20
+        },
+        {
+          "category": "opencode",
+          "items": [
+            "shell"
+          ],
+          "properties": {
+            "name": ["shortText", "longText"],
+            "shell_id": ["longText"],
+            "command": ["longText"],
+            "directory": ["longText"],
+            "cwd": ["longText"],
+            "status": ["shortText", "longText"],
+            "started": ["timestamp"],
+            "completed": ["timestamp"],
+            "duration": ["numericValue", "shortText"],
+            "exit": ["numericValue"]
+          },
+          "supportsMultiple": true,
+          "callerPermissions": [],
+          "suggestedRefreshIntervalSec": 20
+        },
+        {
+          "category": "opencode",
+          "items": [
+            "command"
+          ],
+          "properties": {
+            "name": ["shortText", "longText"],
+            "command": ["longText"],
+            "description": ["longText"],
+            "directory": ["longText"],
+            "session_id": ["longText"]
+          },
+          "supportsMultiple": true,
+          "callerPermissions": [],
+          "suggestedRefreshIntervalSec": 300
         },
         {
           "category": "opencode",
@@ -622,6 +807,77 @@
           ],
           "destructive": false,
           "requiresConfirmation": false,
+          "callerPermissions": []
+        },
+        {
+          "name": "cancel_queued_message",
+          "description": "Cancel a specific pending inbox message after revalidating it against its live session. This permanently removes the queued item. Do not retry uncertain outcomes.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "session_id": {"type": "string", "pattern": "^ses[A-Za-z0-9_-]{1,160}$"},
+              "inbox_id": {"type": "string", "minLength": 1, "maxLength": 200}
+            },
+            "required": ["session_id", "inbox_id"],
+            "additionalProperties": false
+          },
+          "targets": ["opencode/queue"],
+          "destructive": true,
+          "requiresConfirmation": true,
+          "callerPermissions": []
+        },
+        {
+          "name": "set_queued_delivery",
+          "description": "Change delivery mode of a specific pending inbox message after live revalidation. Steering wakes execution and changes the active run. Do not retry uncertain outcomes.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "session_id": {"type": "string", "pattern": "^ses[A-Za-z0-9_-]{1,160}$"},
+              "inbox_id": {"type": "string", "minLength": 1, "maxLength": 200},
+              "delivery": {"type": "string", "enum": ["queue", "steer"]}
+            },
+            "required": ["session_id", "inbox_id", "delivery"],
+            "additionalProperties": false
+          },
+          "targets": ["opencode/queue"],
+          "destructive": true,
+          "requiresConfirmation": true,
+          "callerPermissions": []
+        },
+        {
+          "name": "stop_shell",
+          "description": "Stop a currently running OpenCode shell by exact shell ID and owning absolute server directory. Revalidates live state before stopping; retained output is deleted. Do not retry uncertain outcomes.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "shell_id": {"type": "string", "minLength": 1, "maxLength": 200},
+              "directory": {"type": "string", "minLength": 1, "maxLength": 4096, "description": "Absolute server path; validated by the runtime."}
+            },
+            "required": ["shell_id", "directory"],
+            "additionalProperties": false
+          },
+          "targets": ["opencode/shell"],
+          "destructive": true,
+          "requiresConfirmation": true,
+          "callerPermissions": []
+        },
+        {
+          "name": "run_command",
+          "description": "Invoke an exact registered OpenCode command in an explicit live unarchived session. Rediscover the command at its location before execution. This action exposes registered command invocation, not arbitrary shell invocation; the command may itself use tools or run shell commands under OpenCode's configured permissions. Do not retry uncertain outcomes.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "session_id": {"type": "string", "pattern": "^ses[A-Za-z0-9_-]{1,160}$"},
+              "command": {"type": "string", "minLength": 1, "maxLength": 200},
+              "text": {"type": "string", "maxLength": 16000},
+              "delivery": {"type": "string", "enum": ["queue", "steer"]}
+            },
+            "required": ["session_id", "command"],
+            "additionalProperties": false
+          },
+          "targets": ["opencode/command", "agent/chats", "opencode/reply", "opencode/replies"],
+          "destructive": true,
+          "requiresConfirmation": true,
           "callerPermissions": []
         }
       ]

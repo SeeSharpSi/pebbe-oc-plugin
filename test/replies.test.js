@@ -30,12 +30,20 @@ function addSession(h, id, title = `Session ${id}`) {
   h.route('GET', `/api/session/${id}`, response({ data: session(id, title) }));
 }
 function addMessages(h, id, messages) {
-  h.route('GET', req => req.path === messagePath(id), req => {
-    assert.equal(req.search.get('type'), 'assistant');
-    assert.equal(req.search.get('order'), 'desc');
-    assert.equal(req.search.get('limit'), '20');
-    return response({ data: messages, cursor: { next: null, previous: null } });
-  });
+  function pageRoute() {
+    h.route('GET', req => req.path === messagePath(id), req => {
+      assert.equal(req.search.get('type'), 'assistant');
+      const limit = Number(req.search.get('limit'));
+      assert.ok(limit > 0 && limit <= 5);
+      const offset = req.search.has('cursor') ? Number(req.search.get('cursor')) : 0;
+      assert.equal(req.search.get('order'), offset === 0 ? 'desc' : null);
+      const data = messages.slice(offset, offset + limit);
+      const next = offset + limit < messages.length ? String(offset + limit) : null;
+      if (next !== null) pageRoute();
+      return response({ data, cursor: { next, previous: null } });
+    });
+  }
+  pageRoute();
 }
 function textMessage(id, text, time = { created: 1700000000000, completed: 1700000001000 }) {
   return { id, type: 'assistant', time, content: [{ type: 'text', text }] };
@@ -56,6 +64,15 @@ test('replies manifest declares exact multiple-source contract, properties, and 
       updated: ['timestamp'],
       complete: ['boolean'],
       status: ['shortText', 'longText'],
+      outcome: ['shortText', 'longText'],
+      cost: ['numericValue', 'shortText'],
+      tokens_input: ['numericValue'],
+      tokens_output: ['numericValue'],
+      tokens_reasoning: ['numericValue'],
+      tokens_cache_read: ['numericValue'],
+      tokens_cache_write: ['numericValue'],
+      agent: ['longText'],
+      model: ['longText'],
       is_default: ['boolean'],
       url: ['longText']
     },
@@ -174,7 +191,7 @@ test('one instance is emitted per included session even when no reply text exist
     assert.equal(result.instances.length, 1);
     const instance = result.instances[0];
     assert.equal(instance.instanceId, 'ses_idle');
-    assert.deepEqual(Object.keys(instance.properties).sort(), ['is_default', 'name', 'session_id', 'status', 'title', 'url']);
+    assert.deepEqual(Object.keys(instance.properties).sort(), ['cost', 'is_default', 'name', 'session_id', 'status', 'title', 'tokens_cache_read', 'tokens_cache_write', 'tokens_input', 'tokens_output', 'tokens_reasoning', 'url']);
     assert.equal(instance.properties.status.shortText.text, 'Idle');
     assert.equal(instance.properties.status.longText.text, 'No reply');
     assert.equal(instance.properties.is_default.boolean.value, true);

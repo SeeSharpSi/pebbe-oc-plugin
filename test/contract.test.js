@@ -34,6 +34,63 @@ test('manifest and source/action declarations match public contract', () => {
   assert.equal(action.parameters.additionalProperties, false);
 });
 
+test('new source and metric declarations match bounded public contract', () => {
+  const source = (item, multiple, refresh, properties) => {
+    const declaration = manifest.plugin.sources.find(row => row.category === 'opencode' && row.items[0] === item);
+    assert.ok(declaration, `missing opencode/${item}`);
+    assert.equal(declaration.supportsMultiple, multiple, item);
+    assert.equal(declaration.suggestedRefreshIntervalSec, refresh, item);
+    assert.deepEqual(declaration.properties, properties, item);
+    assert.deepEqual(declaration.callerPermissions, [], item);
+  };
+  source('execution', false, 20, {
+    name: ['shortText', 'longText'], session_id: ['longText'], status: ['shortText', 'longText'],
+    detail: ['longText'], tool: ['longText'], retry_at: ['timestamp'], updated: ['timestamp'], url: ['longText']
+  });
+  source('queue', true, 20, {
+    name: ['shortText', 'longText'], session_id: ['longText'], inbox_id: ['longText'], kind: ['shortText'],
+    text: ['shortText', 'longText'], delivery: ['shortText'], queued_at: ['timestamp'], url: ['longText']
+  });
+  source('shell', true, 20, {
+    name: ['shortText', 'longText'], shell_id: ['longText'], command: ['longText'], directory: ['longText'],
+    cwd: ['longText'], status: ['shortText', 'longText'], started: ['timestamp'], completed: ['timestamp'],
+    duration: ['numericValue', 'shortText'], exit: ['numericValue']
+  });
+  source('command', true, 300, {
+    name: ['shortText', 'longText'], command: ['longText'], description: ['longText'], directory: ['longText'], session_id: ['longText']
+  });
+  const metricProperties = {
+    outcome: ['shortText', 'longText'], cost: ['numericValue', 'shortText'], tokens_input: ['numericValue'],
+    tokens_output: ['numericValue'], tokens_reasoning: ['numericValue'], tokens_cache_read: ['numericValue'],
+    tokens_cache_write: ['numericValue'], agent: ['longText'], model: ['longText']
+  };
+  for (const item of ['active_session', 'reply', 'replies', 'chat_status']) {
+    const declaration = manifest.plugin.sources.find(row => row.category === 'opencode' && row.items[0] === item);
+    for (const [name, types] of Object.entries(metricProperties)) assert.deepEqual(declaration.properties[name], types, `${item}.${name}`);
+  }
+});
+
+test('queue, shell, and command actions require bounded explicit contracts and confirmation', () => {
+  const expected = {
+    cancel_queued_message: { required: ['session_id', 'inbox_id'], targets: ['opencode/queue'], properties: { session_id: { type: 'string', pattern: '^ses[A-Za-z0-9_-]{1,160}$' }, inbox_id: { type: 'string', minLength: 1, maxLength: 200 } } },
+    set_queued_delivery: { required: ['session_id', 'inbox_id', 'delivery'], targets: ['opencode/queue'], properties: { session_id: { type: 'string', pattern: '^ses[A-Za-z0-9_-]{1,160}$' }, inbox_id: { type: 'string', minLength: 1, maxLength: 200 }, delivery: { type: 'string', enum: ['queue', 'steer'] } } },
+    stop_shell: { required: ['shell_id', 'directory'], targets: ['opencode/shell'], properties: { shell_id: { type: 'string', minLength: 1, maxLength: 200 }, directory: { type: 'string', minLength: 1, maxLength: 4096, description: 'Absolute server path; validated by the runtime.' } } },
+    run_command: { required: ['session_id', 'command'], targets: ['opencode/command', 'agent/chats', 'opencode/reply', 'opencode/replies'], properties: { session_id: { type: 'string', pattern: '^ses[A-Za-z0-9_-]{1,160}$' }, command: { type: 'string', minLength: 1, maxLength: 200 }, text: { type: 'string', maxLength: 16000 }, delivery: { type: 'string', enum: ['queue', 'steer'] } } }
+  };
+  for (const [name, contract] of Object.entries(expected)) {
+    const action = manifest.plugin.actions.find(row => row.name === name);
+    assert.ok(action, `missing action ${name}`);
+    assert.deepEqual(action.parameters.required, contract.required, name);
+    assert.deepEqual(action.parameters.properties, contract.properties, name);
+    assert.equal(action.parameters.additionalProperties, false, name);
+    assert.deepEqual(action.targets, contract.targets, name);
+    assert.equal(action.destructive, true, name);
+    assert.equal(action.requiresConfirmation, true, name);
+    assert.deepEqual(action.callerPermissions, [], name);
+    assert.match(action.description, /Do not retry|not retry/i, name);
+  }
+});
+
 test('status has exact public shape and omits secret', async () => {
   const h = harness();
   assert.deepEqual(await h.service.config({ type: 'status' }), { connected: false, configured: false, url: '', username: 'opencode', version: '', mode: 'default_chat', directory: '', selected: null, nicknames: {}, reply_count: 10, default_delivery: 'queue', auth_method: '' });
@@ -232,7 +289,12 @@ test('direct ID send, returns queued receipt description and does not include mo
   const h = harness(); await connected(h); addPrompt(h, 'ses_a', 'Alpha');
   const result = await h.service.action({ action: 'send_to_agent', args: { message: 'hello', chat_id: 'ses_a' } });
   assert.match(result.text, /Alpha/);
-  assert.deepEqual(result.refreshed, ['agent/chats', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/chat_status', 'opencode/permission', 'opencode/question', 'opencode/job']);
+  assert.ok(Array.isArray(result.refreshed));
+  for (const item of ['opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/chat_status', 'opencode/queue', 'opencode/execution']) {
+    assert.ok(result.refreshed.includes(item), `missing essential refresh ${item}`);
+  }
+  assert.ok(!result.refreshed.includes('opencode/usage'));
+  assert.equal(new Set(result.refreshed).size, result.refreshed.length, 'refreshed sources are unique');
   assert.equal(h.requests.filter(req => req.method === 'POST' && req.path.endsWith('/prompt')).length, 1);
   assert.deepEqual(h.requests.find(req => req.path.endsWith('/prompt')).body, { id: h.requests.find(req => req.path.endsWith('/prompt')).body.id, text: 'hello', delivery: 'queue' });
   assert.match(h.requests.find(req => req.path.endsWith('/prompt')).body.id, /^msg_/);

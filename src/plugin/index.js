@@ -2,6 +2,12 @@
   'use strict';
 
   var STATE_KEY = 'opencode.plugin.state.v1';
+  var SNAPSHOT_CACHE_KEY = 'opencode.plugin.cache.v1';
+  var LEGACY_CACHE_META_KEY = 'opencode.plugin.cache.meta.v1';
+  var SNAPSHOT_TTL_MS = 5000;
+  var MAX_CACHE_TTL_MS = 60000;
+  var MAX_CACHE_ENTRIES = 64;
+  var MAX_CACHE_BYTES = 262144;
   var DEFAULT_USERNAME = 'opencode';
   var DEFAULT_TITLE = 'New session';
   var PAGE_LIMIT = 50;
@@ -107,7 +113,7 @@
     return {
       url: '', username: DEFAULT_USERNAME, password: '', version: '', mode: 'default_chat',
       directory: '', selected: null, lastSessionID: null, nicknames: {}, reply_count: DEFAULT_REPLY_COUNT,
-      default_delivery: DEFAULT_DELIVERY, auth_method: '', last_seen: {}
+      default_delivery: DEFAULT_DELIVERY, auth_method: '', last_seen: {}, cache_generation: ''
     };
   }
 
@@ -121,6 +127,9 @@
     var fetcher = options.fetch;
     var now = options.now || Date.now;
     var random = options.random;
+    var cacheWriteChain = Promise.resolve();
+    var sourceActiveMapInFlight = Object.create(null);
+    var legacyCacheMetaInFlight = Object.create(null);
     if (!storage || typeof storage.getItem !== 'function' || typeof storage.setItem !== 'function' ||
         typeof storage.removeItem !== 'function' || typeof fetcher !== 'function') {
       throw new TypeError('storage and fetch are required');
@@ -149,13 +158,216 @@
     }
 
     async function save(state) {
+      if (state.url && state.password && /^2\./.test(state.version) && !state.cache_generation) {
+        state.cache_generation = newCacheGeneration();
+      }
       try { await storage.setItem(STATE_KEY, JSON.stringify(state)); }
       catch (_) { throw makeError('PLUGIN_UNAVAILABLE', 'Secure storage is unavailable.'); }
+      if (state.cache_generation) { try { await storage.removeItem(LEGACY_CACHE_META_KEY); } catch (_) {} }
     }
 
-    function refresh() {
+    function newCacheGeneration() {
+      requestCounter += 1;
+      return String(now()) + '-' + String(random ? random() : Math.random().toString(36).slice(2)) + '-' + requestCounter;
+    }
+
+    async function invalidateSnapshotCache(state) {
+      state.cache_generation = newCacheGeneration();
+      try { await storage.removeItem(SNAPSHOT_CACHE_KEY); } catch (_) {}
+      try { await storage.removeItem(LEGACY_CACHE_META_KEY); } catch (_) {}
+    }
+
+    async function invalidateAfterMutation(state) {
+      try {
+        var fresh = await load();
+        if (fresh.url === state.url && fresh.username === state.username && fresh.password === state.password && fresh.version === state.version) {
+          await invalidateSnapshotCache(fresh);
+          await save(fresh);
+        } else await storage.removeItem(SNAPSHOT_CACHE_KEY);
+      } catch (_) { try { await storage.removeItem(SNAPSHOT_CACHE_KEY); } catch (_) {} }
+    }
+
+    async function invalidateBeforeMutation(state) {
+      var fresh = await load();
+      if (fresh.url !== state.url || fresh.username !== state.username || fresh.password !== state.password || fresh.version !== state.version) {
+        throw makeError('PLUGIN_UNAVAILABLE', 'Connection changed before mutation. Refresh and retry.');
+      }
+      fresh.cache_generation = newCacheGeneration();
+      await save(fresh);
+      try { await storage.removeItem(SNAPSHOT_CACHE_KEY); } catch (_) {}
+    }
+
+    function legacyMetaValid(meta, state) {
+      return isPlainObject(meta) && Object.keys(meta).sort().join(',') === 'generation,url,username,version' &&
+        typeof meta.generation === 'string' && meta.generation.length > 0 && meta.generation.length <= 128 &&
+        meta.url === state.url && meta.username === state.username && meta.version === state.version;
+    }
+
+    function parseLegacyMeta(raw) {
+      if (raw === null || raw === undefined) return null;
+      try {
+        var serialized = typeof raw === 'string' ? raw : JSON.stringify(raw);
+        if (typeof serialized !== 'string' || serializedByteLength(serialized) > 2048) return null;
+        return typeof raw === 'string' ? JSON.parse(raw) : raw;
+      } catch (_) { return null; }
+    }
+
+    async function persistedLegacyIdentityMatches(state) {
+      try {
+        var raw = await storage.getItem(STATE_KEY);
+        var saved = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        return isPlainObject(saved) && saved.url === state.url && saved.username === state.username &&
+          saved.password === state.password && saved.version === state.version && !saved.cache_generation;
+      } catch (_) { return false; }
+    }
+
+    async function removeLegacyMetaIfGeneration(generation) {
+      try {
+        var raw = await storage.getItem(LEGACY_CACHE_META_KEY);
+        var meta = parseLegacyMeta(raw);
+        if (isPlainObject(meta) && meta.generation === generation) await storage.removeItem(LEGACY_CACHE_META_KEY);
+      } catch (_) {}
+    }
+
+    async function sourceCacheState(state) {
+      if (state.cache_generation || !state.url || !state.username || !state.password || !/^2\./.test(state.version) ||
+          state.url.length > 1500 || state.username.length > 200 || state.version.length > 64) return state;
+      var identity = state.url + '\n' + state.username + '\n' + state.version;
+      if (legacyCacheMetaInFlight[identity]) return legacyCacheMetaInFlight[identity];
+      var pending = (async function () {
+        try {
+          var rawMeta = await storage.getItem(LEGACY_CACHE_META_KEY);
+          var meta = parseLegacyMeta(rawMeta);
+          if (!legacyMetaValid(meta, state)) {
+            if (!await persistedLegacyIdentityMatches(state)) return state;
+            meta = { url: state.url, username: state.username, version: state.version, generation: newCacheGeneration() };
+            var serialized = JSON.stringify(meta);
+            if (serializedByteLength(serialized) > 2048) return state;
+            await storage.setItem(LEGACY_CACHE_META_KEY, serialized);
+            if (!await persistedLegacyIdentityMatches(state)) {
+              await removeLegacyMetaIfGeneration(meta.generation);
+              return state;
+            }
+          } else if (!await persistedLegacyIdentityMatches(state)) {
+            await removeLegacyMetaIfGeneration(meta.generation);
+            return state;
+          }
+          return Object.assign({}, state, { cache_generation: meta.generation });
+        } catch (_) { return state; }
+      })();
+      legacyCacheMetaInFlight[identity] = pending;
+      try { return await pending; }
+      finally { if (legacyCacheMetaInFlight[identity] === pending) delete legacyCacheMetaInFlight[identity]; }
+    }
+
+    async function readCacheEnvelope(state) {
+      if (!state.cache_generation) return null;
+      try {
+        var raw = await storage.getItem(SNAPSHOT_CACHE_KEY);
+        if (raw === null || raw === undefined) return null;
+        var serialized = typeof raw === 'string' ? raw : JSON.stringify(raw);
+        if (typeof serialized !== 'string' || serializedByteLength(serialized) > MAX_CACHE_BYTES) return null;
+        var cache = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        if (!isPlainObject(cache) || Object.keys(cache).sort().join(',') !== 'entries,generation,url,username,version' ||
+            cache.version !== 1 || typeof cache.generation !== 'string' || cache.generation.length > 128 || cache.generation !== state.cache_generation ||
+            cache.url !== state.url || cache.username !== state.username || !isPlainObject(cache.entries) || Object.keys(cache.entries).length > MAX_CACHE_ENTRIES) return null;
+        var current = now();
+        var keys = Object.keys(cache.entries);
+        for (var i = 0; i < keys.length; i += 1) {
+          var entry = cache.entries[keys[i]];
+          if (!keys[i] || keys[i].length > 220 || !isPlainObject(entry) ||
+              Object.keys(entry).sort().join(',') !== 'expires,value,written' ||
+              typeof entry.expires !== 'number' || !Number.isFinite(entry.expires) ||
+              typeof entry.written !== 'number' || !Number.isFinite(entry.written) ||
+              entry.written > current || entry.expires <= entry.written || entry.expires - entry.written > MAX_CACHE_TTL_MS ||
+              entry.expires > current + MAX_CACHE_TTL_MS || !isPlainObject(entry.value)) return null;
+          if (entry.expires <= current) delete cache.entries[keys[i]];
+        }
+        return cache;
+      } catch (_) { return null; }
+    }
+
+    function serializedByteLength(value) {
+      var bytes = 0;
+      for (var i = 0; i < value.length; i += 1) {
+        var code = value.charCodeAt(i);
+        if (code < 0x80) bytes += 1;
+        else if (code < 0x800) bytes += 2;
+        else if (code >= 0xd800 && code <= 0xdbff && i + 1 < value.length && value.charCodeAt(i + 1) >= 0xdc00 && value.charCodeAt(i + 1) <= 0xdfff) {
+          bytes += 4;
+          i += 1;
+        } else bytes += 3;
+        if (bytes > MAX_CACHE_BYTES) return bytes;
+      }
+      return bytes;
+    }
+
+    async function readSnapshotCache(state, name) {
+      if (!await persistedGenerationMatches(state)) return null;
+      var cache = await readCacheEnvelope(state);
+      var entry = cache && cache.entries[name];
+      return entry && entry.expires > now() ? entry.value : null;
+    }
+
+    async function persistedGenerationMatches(state) {
+      try {
+        var raw = await storage.getItem(STATE_KEY);
+        var saved = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        if (!isPlainObject(saved) || saved.url !== state.url || saved.username !== state.username ||
+            saved.password !== state.password || saved.version !== state.version) return false;
+        if (saved.cache_generation) return saved.cache_generation === state.cache_generation;
+        if (!state.cache_generation) return false;
+        var rawMeta = await storage.getItem(LEGACY_CACHE_META_KEY);
+        var meta = parseLegacyMeta(rawMeta);
+        return legacyMetaValid(meta, state) && meta.generation === state.cache_generation;
+      } catch (_) { return false; }
+    }
+
+    function writeSnapshotCache(state, name, value, ttl) {
+      if (!state.cache_generation) return Promise.resolve();
+      var task = cacheWriteChain.then(async function () {
+        try {
+          if (!await persistedGenerationMatches(state)) return;
+          var cache = await readCacheEnvelope(state);
+          if (!cache) cache = { version: 1, generation: state.cache_generation, url: state.url, username: state.username, entries: {} };
+          var current = now();
+          Object.keys(cache.entries).forEach(function (key) {
+            if (cache.entries[key].expires <= current) delete cache.entries[key];
+          });
+          cache.entries[name] = { expires: current + Math.min(ttl || SNAPSHOT_TTL_MS, MAX_CACHE_TTL_MS), written: current, value: value };
+          var serialize = function () { return JSON.stringify(cache); };
+          var serialized = serialize();
+          while ((Object.keys(cache.entries).length > MAX_CACHE_ENTRIES || serializedByteLength(serialized) > MAX_CACHE_BYTES) && Object.keys(cache.entries).length > 1) {
+            var oldest = Object.keys(cache.entries).filter(function (key) { return key !== name; }).sort(function (a, b) {
+              return cache.entries[a].written - cache.entries[b].written;
+            })[0];
+            if (!oldest) break;
+            delete cache.entries[oldest];
+            serialized = serialize();
+          }
+          if (serializedByteLength(serialized) > MAX_CACHE_BYTES || !await persistedGenerationMatches(state)) return;
+          await storage.setItem(SNAPSHOT_CACHE_KEY, serialized);
+          if (!await persistedGenerationMatches(state)) {
+            var after = await readCacheEnvelope(state);
+            if (after && after.generation === state.cache_generation) await storage.removeItem(SNAPSHOT_CACHE_KEY);
+          }
+        } catch (_) {}
+      });
+      cacheWriteChain = task.catch(function () {});
+      return task;
+    }
+
+    function sourceRefreshes() {
+      return ['agent/chats', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/chat_status', 'opencode/permission', 'opencode/question', 'opencode/job', 'opencode/execution', 'opencode/queue', 'opencode/shell', 'opencode/command'];
+    }
+
+    var permissionRefreshes = ['opencode/permission', 'opencode/chat_status', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/execution'];
+    var questionRefreshes = ['opencode/question', 'opencode/chat_status', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/execution'];
+    var interruptRefreshes = ['opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/chat_status', 'opencode/permission', 'opencode/question', 'opencode/job', 'opencode/execution', 'opencode/queue', 'opencode/shell'];
+
+    function refresh(sources) {
       if (root.Pebble && typeof root.Pebble.refreshSources === 'function') {
-        try { root.Pebble.refreshSources(['agent/chats', 'agent/configured', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/chat_status', 'opencode/permission', 'opencode/question', 'opencode/job', 'opencode/usage']); } catch (_) {}
+        try { root.Pebble.refreshSources(sources || ['agent/chats', 'agent/configured', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/chat_status', 'opencode/permission', 'opencode/question', 'opencode/job', 'opencode/usage', 'opencode/execution', 'opencode/queue', 'opencode/shell', 'opencode/command']); } catch (_) {}
       }
     }
 
@@ -275,16 +487,31 @@
       return cursor;
     }
 
-    async function sessionsPage(state, cursor) {
+    async function sessionsPage(state, cursor, bypassCache) {
       var params = 'limit=' + PAGE_LIMIT + '&parentID=null&archived=false';
       if (cursor !== null) params += '&cursor=' + encodeURIComponent(cursor);
       else params += '&order=desc';
-      var response = await api(state, '/session?' + params);
+      var cacheName = 'sessions:' + (cursor === null ? 'first' : cursor);
+      var cached = bypassCache ? null : await readSnapshotCache(state, cacheName);
+      var response = cached;
+      if (response) {
+        try {
+          if (!Array.isArray(response.data) || !response.cursor || typeof response.cursor !== 'object') throw new Error('invalid cache');
+          response.data.forEach(function (item) { validSession(item); });
+        } catch (_) { response = null; cached = null; }
+      }
+      if (!response) response = await api(state, '/session?' + params);
       if (!response || !Array.isArray(response.data) || !response.cursor || typeof response.cursor !== 'object' ||
           (response.cursor.next !== undefined && response.cursor.next !== null && typeof response.cursor.next !== 'string')) {
         throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid session data.');
       }
+      response.data.forEach(function (item) { validSession(item); });
       if (response.cursor.next === undefined) response.cursor.next = null;
+      if (!cached) {
+        await writeSnapshotCache(state, cacheName, {
+          data: response.data.map(safeSessionSnapshot), cursor: { next: response.cursor.next }
+        });
+      }
       return response;
     }
 
@@ -304,7 +531,7 @@
       var seenCursors = Object.create(null);
       var cursor = null;
       for (var page = 0; page < MAX_PAGES; page += 1) {
-        var response = await sessionsPage(state, cursor);
+        var response = await sessionsPage(state, cursor, true);
         response.data.forEach(function (item) {
           if (!validateListSession(item)) return;
           if (!ids[item.id]) { ids[item.id] = true; all.push(item); }
@@ -321,13 +548,13 @@
       return all;
     }
 
-    async function chatRows(state, cursor) {
+    async function chatRows(state, cursor, includeInfo) {
       cursor = validateCursor(cursor);
       var page = await sessionsPage(state, cursor);
       var sessions = [];
       page.data.forEach(function (item) {
         if (!validateListSession(item)) return;
-        sessions.push({
+        var row = {
           session_id: item.id,
           title: titleOf(item),
           nickname: state.nicknames[item.id] || '',
@@ -335,7 +562,9 @@
           directory: item.location.directory,
           url: sessionURL(state.url, item.id),
           isDefault: !!(state.selected && state.selected.session_id === item.id)
-        });
+        };
+        if (includeInfo) row.sessionInfo = item;
+        sessions.push(row);
       });
       return { sessions: sessions, next_cursor: page.cursor.next };
     }
@@ -411,7 +640,7 @@
       return limited;
     }
 
-    async function activeSnapshot(state, onValidated) {
+    async function uncachedActiveSnapshot(state, onValidated) {
       requireConnection(state);
       var response = await api(state, '/session/active');
       var activeMap = response && response.data;
@@ -519,6 +748,85 @@
       };
     }
 
+    var activeSnapshotInFlight = Object.create(null);
+    function safeSessionSnapshot(session) {
+      var result = { id: session.id, title: titleOf(session), location: { directory: session.location.directory }, time: {} };
+      ['created', 'updated', 'archived'].forEach(function (key) {
+        if (session.time && session.time[key] !== undefined && (typeof session.time[key] === 'number' || typeof session.time[key] === 'boolean')) result.time[key] = session.time[key];
+      });
+      if (session.parentID !== undefined) result.parentID = session.parentID;
+      if (typeof session.agent === 'string') result.agent = session.agent;
+      if (isPlainObject(session.model) && typeof session.model.providerID === 'string' && typeof session.model.id === 'string') {
+        result.model = { providerID: session.model.providerID, id: session.model.id };
+      }
+      if (typeof session.outcome === 'string') result.outcome = session.outcome;
+      if (typeof session.cost === 'number' && Number.isFinite(session.cost) && session.cost >= 0) result.cost = session.cost;
+      if (isPlainObject(session.tokens)) {
+        result.tokens = {};
+        ['input', 'output', 'reasoning'].forEach(function (key) {
+          if (typeof session.tokens[key] === 'number' && Number.isFinite(session.tokens[key]) && session.tokens[key] >= 0) result.tokens[key] = session.tokens[key];
+        });
+        if (isPlainObject(session.tokens.cache)) {
+          result.tokens.cache = {};
+          ['read', 'write'].forEach(function (key) {
+            if (typeof session.tokens.cache[key] === 'number' && Number.isFinite(session.tokens.cache[key]) && session.tokens.cache[key] >= 0) result.tokens.cache[key] = session.tokens.cache[key];
+          });
+        }
+      }
+      return result;
+    }
+
+    async function activeSnapshot(state, onValidated) {
+      requireConnection(state);
+      var key = state.cache_generation || '';
+      {
+        var cached = await readSnapshotCache(state, 'active');
+        if (cached && Array.isArray(cached.sessions) && Array.isArray(cached.attention) && Array.isArray(cached.roots) && Array.isArray(cached.attentionRoots) &&
+            cached.sessions.length <= 100 && cached.attention.length === cached.sessions.length && cached.roots.length <= cached.sessions.length && cached.attentionRoots.length <= cached.roots.length) {
+          try {
+            var restored = cached.sessions.map(function (detail, index) {
+                if (!isPlainObject(detail) || !isPlainObject(detail.session) || !sessionID(detail.session.id) ||
+                    !Array.isArray(detail.path) || !detail.path.length || detail.path.length > 33 || !detail.path.every(sessionID) ||
+                    detail.path[detail.path.length - 1] !== detail.session.id ||
+                    (detail.parentID !== null && detail.parentID !== undefined && !sessionID(detail.parentID)) ||
+                    (detail.attention !== null && ['permission', 'form'].indexOf(detail.attention) === -1) || cached.attention[index] !== detail.attention) throw new Error('invalid');
+                validSession(detail.session);
+                return { session: detail.session, parentID: detail.parentID || null, path: detail.path, attention: detail.attention };
+            });
+            if (!cached.roots.every(sessionID) || !cached.attentionRoots.every(sessionID) ||
+                cached.roots.some(function (id, i) { return cached.roots.indexOf(id) !== i; }) ||
+                cached.attentionRoots.some(function (id, i) { return cached.attentionRoots.indexOf(id) !== i; })) throw new Error('invalid');
+            var expectedRoots = Object.create(null);
+            var expectedAttentionRoots = Object.create(null);
+            restored.forEach(function (detail) {
+              expectedRoots[detail.path[0]] = true;
+              if (detail.attention) expectedAttentionRoots[detail.path[0]] = true;
+            });
+            if (Object.keys(expectedRoots).length !== cached.roots.length || cached.roots.some(function (id) { return !expectedRoots[id]; }) ||
+                Object.keys(expectedAttentionRoots).length !== cached.attentionRoots.length || cached.attentionRoots.some(function (id) { return !expectedAttentionRoots[id]; })) throw new Error('invalid');
+            var ready = { sessions: restored, attention: cached.attention, roots: cached.roots, attentionRoots: cached.attentionRoots };
+            if (onValidated) onValidated();
+            return ready;
+          } catch (_) {}
+        }
+      }
+      if (activeSnapshotInFlight[key]) return activeSnapshotInFlight[key].then(function (value) { if (onValidated) onValidated(); return value; });
+      var pending = uncachedActiveSnapshot(state, onValidated).then(async function (snapshot) {
+        {
+          var packed = {
+            sessions: snapshot.sessions.map(function (detail) {
+              return { session: safeSessionSnapshot(detail.session), parentID: detail.parentID, path: detail.path, attention: detail.attention };
+            }),
+            attention: snapshot.attention, roots: snapshot.roots, attentionRoots: snapshot.attentionRoots
+          };
+          await writeSnapshotCache(state, 'active', packed);
+        }
+        return snapshot;
+      }).finally(function () { delete activeSnapshotInFlight[key]; });
+      activeSnapshotInFlight[key] = pending;
+      return pending;
+    }
+
     function activeInstance(state, detail) {
       var session = detail.session;
       var attention = detail.attention;
@@ -542,6 +850,7 @@
       if (typeof updated === 'number' && Number.isFinite(updated) && updated >= 0) {
         properties.updated = { timestamp: { value: Math.floor(updated / 1000) } };
       }
+      addSessionMetrics(properties, session);
       return { instanceId: session.id, properties: properties };
     }
 
@@ -549,31 +858,81 @@
       return typeof value === 'string' && value.length > 0 && value.length <= (max || 200) && !/[\u0000-\u001f\u007f]/.test(value);
     }
 
-    async function latestAssistantReply(state, id) {
-      var response = await api(state, sessionPath(id) + '/message?type=assistant&order=desc&limit=20');
-      if (!response || !Array.isArray(response.data) || response.data.length > 20 || !response.cursor || typeof response.cursor !== 'object') {
-        throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid assistant messages.');
+    function addSessionMetrics(properties, session) {
+      if (!session || typeof session !== 'object') return;
+      if (['succeeded', 'failed', 'interrupted'].indexOf(session.outcome) !== -1) properties.outcome = { shortText: { text: session.outcome }, longText: { text: session.outcome } };
+      if (session.model && typeof session.model.providerID === 'string' && session.model.providerID && typeof session.model.id === 'string' && session.model.id) {
+        properties.model = { longText: { text: session.model.providerID + '/' + session.model.id } };
       }
+      if (typeof session.agent === 'string' && session.agent) properties.agent = { longText: { text: session.agent } };
+      if (typeof session.cost === 'number' && Number.isFinite(session.cost) && session.cost >= 0) {
+        var costText = '$' + session.cost.toFixed(2);
+        if (costText.length > 32) costText = '$' + String(session.cost);
+        properties.cost = { numericValue: { value: session.cost, min: 0, unit: 'USD' }, shortText: { text: costText } };
+      }
+      var tokens = session.tokens;
+      if (!isPlainObject(tokens)) return;
+      var fields = { input: 'tokens_input', output: 'tokens_output', reasoning: 'tokens_reasoning' };
+      Object.keys(fields).forEach(function (key) {
+        var value = tokens[key];
+        if (typeof value === 'number' && Number.isFinite(value) && value >= 0) properties[fields[key]] = { numericValue: { value: value, min: 0 } };
+      });
+      if (isPlainObject(tokens.cache)) {
+        [['read', 'tokens_cache_read'], ['write', 'tokens_cache_write']].forEach(function (entry) {
+          var value = tokens.cache[entry[0]];
+          if (typeof value === 'number' && Number.isFinite(value) && value >= 0) properties[entry[1]] = { numericValue: { value: value, min: 0 } };
+        });
+      }
+    }
+
+    async function latestAssistantReply(state, id) {
       var chosen = null;
       var chosenText = '';
-      response.data.forEach(function (message) {
-        if (!message || message.type !== 'assistant' || !nonemptyID(message.id, 200) ||
-            (message.sessionID !== undefined && message.sessionID !== id) || !message.time || typeof message.time !== 'object' ||
-            typeof message.time.created !== 'number' || !Number.isFinite(message.time.created) || message.time.created < 0 ||
-            (message.time.completed !== undefined && (typeof message.time.completed !== 'number' || !Number.isFinite(message.time.completed) || message.time.completed < 0)) ||
-            !Array.isArray(message.content)) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid assistant messages.');
-        var text = '';
-        message.content.forEach(function (part) {
-          if (!isPlainObject(part) || ['text', 'reasoning', 'tool'].indexOf(part.type) === -1) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid assistant messages.');
-          if (part.type === 'text') {
-            if (typeof part.text !== 'string') throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid assistant messages.');
-            text += part.text;
-          }
+      var cursor = null;
+      var seenCursors = Object.create(null);
+      var seenIDs = Object.create(null);
+      var inspected = 0;
+      var newestID = null;
+      while (inspected < 20 && !chosen) {
+        var amount = Math.min(5, 20 - inspected);
+        var path = sessionPath(id) + '/message?type=assistant&limit=' + amount;
+        if (cursor === null) path += '&order=desc';
+        else path += '&cursor=' + encodeURIComponent(cursor);
+        var response = await api(state, path);
+        if (!response || !Array.isArray(response.data) || response.data.length > amount || !response.cursor || typeof response.cursor !== 'object' ||
+            (response.cursor.next !== undefined && response.cursor.next !== null && typeof response.cursor.next !== 'string')) {
+          throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid assistant messages.');
+        }
+        if (typeof response.cursor.next === 'string' && response.cursor.next.length > 4096) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid pagination data.');
+        response.data.forEach(function (message) {
+          if (!message || message.type !== 'assistant' || !/^msg_[A-Za-z0-9_-]{1,196}$/.test(message.id) || seenIDs[message.id] ||
+              (message.sessionID !== undefined && message.sessionID !== id) || !message.time || typeof message.time !== 'object' ||
+              typeof message.time.created !== 'number' || !Number.isFinite(message.time.created) || message.time.created < 0 ||
+              (message.time.completed !== undefined && (typeof message.time.completed !== 'number' || !Number.isFinite(message.time.completed) || message.time.completed < 0)) ||
+              !Array.isArray(message.content)) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid assistant messages.');
+          seenIDs[message.id] = true;
+          if (!newestID) newestID = message.id;
+          inspected += 1;
+          var text = '';
+          message.content.forEach(function (part) {
+            if (!isPlainObject(part) || ['text', 'reasoning', 'tool'].indexOf(part.type) === -1) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid assistant messages.');
+            if (part.type === 'text') {
+              if (typeof part.text !== 'string') throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid assistant messages.');
+              text += part.text;
+            }
+          });
+          if (!chosen && text) { chosen = message; chosenText = text; }
         });
-        if (!chosen && text) { chosen = message; chosenText = text; }
-      });
+        var next = response.cursor.next === undefined ? null : response.cursor.next;
+        if (chosen || !response.data.length || next === null || next === '') break;
+        if (next.length > 4096 || seenCursors[next]) {
+          throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid pagination data.');
+        }
+        seenCursors[next] = true;
+        cursor = next;
+      }
       if (!chosen) return null;
-      return { message: chosen, text: chosenText };
+      return { message: chosen, text: chosenText, newestID: newestID, inspected: inspected };
     }
 
     function replyStatus(message) {
@@ -582,9 +941,57 @@
       return failed ? 'Error' : complete ? 'Done' : 'Writing';
     }
 
+    async function sourceActiveMap(state) {
+      var cached = await readSnapshotCache(state, 'active-map');
+      if (cached && Array.isArray(cached.ids) && cached.ids.length <= 100 && cached.ids.every(sessionID) &&
+          cached.ids.every(function (id, index) { return cached.ids.indexOf(id) === index; })) return cached.ids;
+      var key = state.cache_generation + '|' + state.url + '|' + state.username;
+      if (sourceActiveMapInFlight[key]) return sourceActiveMapInFlight[key];
+      var pending = (async function () {
+        var response = await api(state, '/session/active');
+        var map = response && response.data;
+        if (!isPlainObject(map) || Object.keys(map).length > 100) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid active session data.');
+        var ids = Object.keys(map);
+        ids.forEach(function (id) {
+          if (!sessionID(id) || !isPlainObject(map[id]) || map[id].type !== 'running') throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid active session data.');
+        });
+        await writeSnapshotCache(state, 'active-map', { ids: ids }, SNAPSHOT_TTL_MS);
+        return ids;
+      })();
+      sourceActiveMapInFlight[key] = pending;
+      try { return await pending; }
+      finally { if (sourceActiveMapInFlight[key] === pending) delete sourceActiveMapInFlight[key]; }
+    }
+
+    async function sourceAssistantReply(state, id, session) {
+      var updated = session && session.time && session.time.updated;
+      var cached = await readSnapshotCache(state, 'reply:' + id);
+      if (cached && Object.keys(cached).sort().join(',') === 'completed,created,failed,finish,id,text,updated' && cached.failed === false &&
+          typeof updated === 'number' && Number.isFinite(updated) && updated >= 0 && cached.updated === updated &&
+          /^msg_[A-Za-z0-9_-]{1,196}$/.test(cached.id) && typeof cached.text === 'string' && cached.text.length <= 16384 &&
+          typeof cached.created === 'number' && Number.isFinite(cached.created) && cached.created >= 0 && typeof cached.completed === 'number' && Number.isFinite(cached.completed) && cached.completed >= 0 &&
+          ['stop', 'length', 'tool-calls', 'content-filter', 'unknown'].indexOf(cached.finish) !== -1) {
+        try {
+          var activeIDs = await sourceActiveMap(state);
+          if (activeIDs.indexOf(id) === -1) {
+            return { message: { id: cached.id, time: { created: cached.created, completed: cached.completed }, finish: cached.finish, error: cached.failed ? {} : undefined }, text: cached.text, newestID: cached.id };
+          }
+        } catch (_) { /* failure must refresh rather than serve cache */ }
+      }
+      var reply = await latestAssistantReply(state, id);
+      if (reply && reply.newestID === reply.message.id && typeof reply.message.time.completed === 'number' && Number.isFinite(reply.message.time.completed) && reply.message.time.completed >= 0 && !reply.message.error && reply.message.finish !== 'error' &&
+          typeof updated === 'number' && Number.isFinite(updated) && updated >= 0 && typeof reply.message.time.created === 'number' && Number.isFinite(reply.message.time.created) && reply.message.time.created >= 0) {
+        await writeSnapshotCache(state, 'reply:' + id, {
+          id: reply.message.id, text: unicodePrefix(reply.text, 4096), created: reply.message.time.created,
+          completed: reply.message.time.completed, updated: updated, finish: reply.message.finish || 'stop', failed: false
+        }, 60000);
+      }
+      return reply;
+    }
+
     function replyInstances(state, id) {
       return getSession(state, id).then(async function (session) {
-        var reply = await latestAssistantReply(state, id);
+        var reply = await sourceAssistantReply(state, id, session);
         if (!reply) return [];
         var chosen = reply.message;
         var title = state.nicknames[id] || (state.selected && state.selected.session_id === id && state.selected.title) || titleOf(session);
@@ -598,7 +1005,7 @@
           complete: { boolean: { value: complete } },
           status: { shortText: { text: replyStatus(chosen) }, longText: { text: replyStatus(chosen) } },
           url: { longText: { text: sessionURL(state.url, id) } }
-        }}];
+        }}].map(function (instance) { addSessionMetrics(instance.properties, session); return instance; });
       });
     }
 
@@ -623,11 +1030,12 @@
       } else {
         properties.status = { shortText: { text: 'Idle' }, longText: { text: 'No reply' } };
       }
+      addSessionMetrics(properties, meta.sessionInfo);
       return { instanceId: meta.session_id, properties: properties };
     }
 
     async function repliesInstances(state) {
-      var page = await chatRows(state, null);
+      var page = await chatRows(state, null, true);
       var recent = page.sessions;
       var byID = Object.create(null);
       recent.forEach(function (row) {
@@ -663,10 +1071,10 @@
                 session_id: session.id,
                 title: titleOf(session),
                 nickname: state.nicknames[session.id] || '',
-                url: sessionURL(state.url, session.id)
+                url: sessionURL(state.url, session.id), sessionInfo: session
               };
             }
-            var reply = await latestAssistantReply(state, meta.session_id);
+            var reply = await sourceAssistantReply(state, meta.session_id, meta.sessionInfo);
             return repliesInstance(state, meta, reply, defaultID);
           });
         }));
@@ -710,7 +1118,7 @@
     function metaFromRow(row) {
       return {
         session_id: row.session_id, title: row.title, nickname: row.nickname || '',
-        updated: row.updated_at || 0, is_subagent: false
+        updated: row.updated_at || 0, is_subagent: false, sessionInfo: row.sessionInfo
       };
     }
 
@@ -718,7 +1126,7 @@
       return {
         session_id: session.id, title: titleOf(session), nickname: state.nicknames[session.id] || '',
         updated: Number(session.time.updated || session.time.created) || 0,
-        is_subagent: Boolean(session.parentID)
+        is_subagent: Boolean(session.parentID), sessionInfo: session
       };
     }
 
@@ -760,6 +1168,7 @@
         is_subagent: { boolean: { value: meta.is_subagent } },
         url: { longText: { text: sessionURL(state.url, meta.session_id) } }
       };
+      addSessionMetrics(properties, meta.sessionInfo);
       if (reply) properties.message_id = { longText: { text: reply.message.id } };
       var updated = reply ? (typeof reply.message.time.completed === 'number' ? reply.message.time.completed : reply.message.time.created) : meta.updated;
       if (typeof updated === 'number' && Number.isFinite(updated) && updated >= 0) {
@@ -769,7 +1178,7 @@
     }
 
     async function chatStatusInstances(state) {
-      var loaded = await Promise.all([chatRows(state, null), pendingPermissions(state), pendingForms(state)]);
+      var loaded = await Promise.all([chatRows(state, null, true), pendingPermissions(state), pendingForms(state)]);
       var recent = loaded[0].sessions;
       var permissions = loaded[1];
       var forms = loaded[2];
@@ -800,7 +1209,7 @@
       try {
         instances = await Promise.all(ids.map(function (id) {
           return limit(async function () {
-            var reply = await latestAssistantReply(state, id);
+            var reply = await sourceAssistantReply(state, id, metas[id].sessionInfo);
             return chatStatusInstance(state, metas[id], reply, permissionCounts[id] || 0, questionCounts[id] || 0, defaultID);
           });
         }));
@@ -936,6 +1345,393 @@
         if (job.kind === 'subagent' && sessionID(job.childSessionID)) props.child_session_id = { longText: { text: job.childSessionID } };
         return { instanceId: job.kind + ':' + job.id, properties: props };
       });
+    }
+
+    function focusedSessionID(state) {
+      if (state.mode === 'default_chat' && state.selected && sessionID(state.selected.session_id)) return state.selected.session_id;
+      return sessionID(state.lastSessionID) ? state.lastSessionID : null;
+    }
+
+    function scopedLocation(state, session) {
+      var directory = session ? session.location.directory : state.directory;
+      if (!directoryPath(directory)) throw makeError('INVALID_ARGS', 'Set an absolute server directory first.');
+      return directory;
+    }
+
+    function boundedDisplayText(value, limit) {
+      return unicodePrefix(value.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' '), limit);
+    }
+
+    function locationQuery(directory) { return '?location%5Bdirectory%5D=' + encodeURIComponent(directory); }
+
+    function validStructuredError(value) {
+      return isPlainObject(value) && typeof value.type === 'string' && !!value.type && value.type.length <= 128 &&
+        typeof value.message === 'string' && validUnicodeString(value.message) && value.message.length <= 65536;
+    }
+
+    function validUnicodeString(value) {
+      if (typeof value !== 'string') return false;
+      for (var i = 0; i < value.length; i += 1) {
+        var code = value.charCodeAt(i);
+        if (code >= 0xd800 && code <= 0xdbff) {
+          if (i + 1 >= value.length || value.charCodeAt(i + 1) < 0xdc00 || value.charCodeAt(i + 1) > 0xdfff) return false;
+          i += 1;
+        } else if (code >= 0xdc00 && code <= 0xdfff) return false;
+      }
+      return true;
+    }
+
+    function safeMessageDetail(error, fallback) {
+      if (!error || typeof error.message !== 'string' || !validUnicodeString(error.message)) return fallback;
+      var text = error.message.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').trim();
+      return text ? unicodePrefix(text, 512) : fallback;
+    }
+
+    function terminalSessionOutcome(value) {
+      if (value === 'failed') return { label: 'Failed', detail: 'Failed' };
+      if (value === 'interrupted') return { label: 'Interrupted', detail: 'Interrupted' };
+      if (value === 'succeeded') return { label: 'Idle', detail: 'Completed' };
+      return null;
+    }
+
+    function validateLocationResponse(response, directory, message) {
+      if (!isPlainObject(response) || !isPlainObject(response.location) || response.location.directory !== directory || !Array.isArray(response.data)) {
+        throw makeError('PLUGIN_UNAVAILABLE', message);
+      }
+      return response.data;
+    }
+
+    function validCommandName(name) {
+      return typeof name === 'string' && name.trim().length > 0 && name.length <= 200 && validUnicodeString(name) && !/[\u0000-\u001f\u007f-\u009f]/.test(name);
+    }
+
+    function validateCommandList(response, directory) {
+      var commands = validateLocationResponse(response, directory, 'OpenCode returned invalid command data.');
+      if (commands.length > 200) throw makeError('PLUGIN_UNAVAILABLE', 'Too many commands to inspect safely.');
+      var seen = Object.create(null);
+      commands.forEach(function (command) {
+        if (!isPlainObject(command) || !validCommandName(command.name) || seen[command.name] ||
+            command.description !== undefined && (typeof command.description !== 'string' || !validUnicodeString(command.description))) {
+          throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid command data.');
+        }
+        seen[command.name] = true;
+      });
+      return commands;
+    }
+
+    async function executionInstances(state) {
+      var id = focusedSessionID(state);
+      if (!id) return { validUntilMs: now() + 20000, instances: [] };
+      var session = await getSession(state, id);
+      var loaded = await Promise.all([
+        api(state, '/session/active'),
+        api(state, sessionPath(id) + '/message?order=desc&limit=5')
+      ]);
+      var active = loaded[0] && loaded[0].data;
+      var timeline = loaded[1];
+      if (!isPlainObject(active) || Object.keys(active).length > 100 || !timeline || !Array.isArray(timeline.data) || timeline.data.length > 5 ||
+          !isPlainObject(timeline.cursor) || Object.keys(timeline.cursor).some(function (key) { return key !== 'next' && key !== 'previous'; }) ||
+          ['next', 'previous'].some(function (key) { return timeline.cursor[key] !== undefined && timeline.cursor[key] !== null &&
+            (typeof timeline.cursor[key] !== 'string' || timeline.cursor[key].length > 4096); })) {
+        throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid execution data.');
+      }
+      Object.keys(active).forEach(function (activeID) {
+        if (!sessionID(activeID) || !isPlainObject(active[activeID]) || active[activeID].type !== 'running') throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid execution data.');
+      });
+      var messages = timeline.data;
+      var seenMessageIDs = Object.create(null);
+      messages.forEach(function (message) {
+        if (!isPlainObject(message) || !/^msg_[A-Za-z0-9_-]{1,196}$/.test(message.id) || !message.time || typeof message.time.created !== 'number' ||
+            !Number.isFinite(message.time.created) || message.time.created < 0 ||
+            seenMessageIDs[message.id] || message.sessionID !== undefined && message.sessionID !== id ||
+            ['agent-switched', 'model-switched', 'location-switched', 'user', 'synthetic', 'system', 'skill', 'shell', 'assistant', 'compaction', 'idle'].indexOf(message.type) === -1) {
+          throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid execution timeline.');
+        }
+        seenMessageIDs[message.id] = true;
+        if (message.type === 'assistant' && (!Array.isArray(message.content) || message.content.length > 1000 ||
+            message.time.completed !== undefined && (typeof message.time.completed !== 'number' || !Number.isFinite(message.time.completed) || message.time.completed < 0) ||
+            message.finish !== undefined && ['stop', 'length', 'tool-calls', 'content-filter', 'error', 'unknown'].indexOf(message.finish) === -1 ||
+            message.error !== undefined && !validStructuredError(message.error) ||
+            message.retry !== undefined && (!isPlainObject(message.retry) || !Number.isInteger(message.retry.attempt) || message.retry.attempt < 1 || typeof message.retry.at !== 'number' || !Number.isFinite(message.retry.at) || message.retry.at < 0 || !validStructuredError(message.retry.error)))) {
+          throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid execution timeline.');
+        }
+        if (message.type === 'assistant') message.content.forEach(function (part) {
+          if (!isPlainObject(part) || ['text', 'reasoning', 'tool'].indexOf(part.type) === -1) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid execution timeline.');
+          if (part.type === 'text' || part.type === 'reasoning') {
+            if (typeof part.text !== 'string' || part.text.length > 1000000 || !validUnicodeString(part.text)) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid execution timeline.');
+          } else if (!isPlainObject(part.state) || ['running', 'streaming', 'completed', 'error'].indexOf(part.state.status) === -1 ||
+              part.name !== undefined && (typeof part.name !== 'string' || !part.name || part.name.length > 200 || !validUnicodeString(part.name) || /[\u0000-\u001f\u007f-\u009f]/.test(part.name)) ||
+              part.state.status === 'error' && !validStructuredError(part.state.error)) {
+            throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid execution timeline.');
+          }
+        });
+        if (message.type === 'agent-switched' && (typeof message.agent !== 'string' || !message.agent || message.agent.length > 200 || !validUnicodeString(message.agent))) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid execution timeline.');
+        if (message.type === 'model-switched' && (!isPlainObject(message.model) || typeof message.model.providerID !== 'string' || !message.model.providerID ||
+            typeof message.model.id !== 'string' || !message.model.id)) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid execution timeline.');
+        if (message.type === 'location-switched' && !isPlainObject(message.location)) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid execution timeline.');
+        if (message.type === 'compaction' && (['running', 'completed', 'failed'].indexOf(message.status) === -1 || ['auto', 'manual'].indexOf(message.reason) === -1 ||
+            (message.status !== 'failed' && (typeof message.summary !== 'string' || !validUnicodeString(message.summary))) || message.status === 'failed' && !validStructuredError(message.error))) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid execution timeline.');
+        if (message.type === 'idle' && (['succeeded', 'failed', 'interrupted'].indexOf(message.outcome) === -1 || message.error !== undefined && !validStructuredError(message.error))) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid execution timeline.');
+      });
+      var current = messages.find(function (message) { return ['agent-switched', 'model-switched', 'location-switched'].indexOf(message.type) === -1; }) || null;
+      var isActive = Object.prototype.hasOwnProperty.call(active, id);
+      var currentTool = null;
+      if (current && current.type === 'assistant') {
+        current.content.forEach(function (part) {
+          if (part.type === 'tool' && ['running', 'streaming'].indexOf(part.state.status) !== -1) currentTool = part;
+        });
+      }
+      var label = 'Idle';
+      var detail = 'Idle';
+      var toolName = currentTool && typeof currentTool.name === 'string' ? unicodePrefix(currentTool.name, 200) : null;
+      var retryAt = null;
+      if (current && current.type === 'compaction') {
+        if (current.status === 'failed') { label = 'Failed'; detail = 'Compaction failed: ' + safeMessageDetail(current.error, 'Compaction failed'); }
+        else if (current.status === 'completed') { label = 'Idle'; detail = 'Compaction completed'; }
+        else if (current.status === 'running') { label = 'Compacting'; detail = 'Compaction running'; }
+        else throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid execution timeline.');
+      }
+      else if (current && current.type === 'assistant') {
+        var retry = current.retry;
+        if (retry && typeof retry === 'object' && typeof retry.at === 'number' && Number.isFinite(retry.at) && retry.at >= 0) {
+          label = 'Retrying'; detail = 'Retry scheduled'; retryAt = retry.at;
+          if (retry.error) detail += ': ' + safeMessageDetail(retry.error, 'Retry scheduled');
+        } else if (currentTool) {
+          label = 'Running'; detail = 'Tool running';
+        } else if (current.content.some(function (part) { return part.type === 'tool' && part.state.status === 'error'; })) {
+          var failedTool = current.content.filter(function (part) { return part.type === 'tool' && part.state.status === 'error'; }).pop();
+          label = 'Failed'; detail = safeMessageDetail(failedTool.state.error, 'Tool failed');
+        }
+        else if (current.error || current.finish === 'error') { label = 'Failed'; detail = safeMessageDetail(current.error, 'Failed'); }
+        else if (current.time.completed === undefined && !isActive && terminalSessionOutcome(session.outcome)) {
+          label = terminalSessionOutcome(session.outcome).label; detail = terminalSessionOutcome(session.outcome).detail;
+        }
+        else if (current.time.completed === undefined) { label = 'Running'; detail = isActive ? 'Generating' : 'Writing'; }
+        else if (current.finish === 'tool-calls') { label = 'Running'; detail = 'Tool call'; }
+      } else if (current && current.type === 'idle') {
+        if (['succeeded', 'failed', 'interrupted'].indexOf(current.outcome) === -1) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid execution timeline.');
+        label = current.outcome === 'failed' ? 'Failed' : current.outcome === 'interrupted' ? 'Interrupted' : 'Idle';
+        detail = current.outcome === 'succeeded' ? 'Completed' : current.outcome === 'failed' ? safeMessageDetail(current.error, 'Failed') : label;
+      }
+      else if (current && ['user', 'synthetic'].indexOf(current.type) !== -1) { label = 'Waiting'; detail = 'Waiting for assistant'; }
+      else if (!current || ['agent-switched', 'model-switched', 'location-switched'].indexOf(current.type) !== -1) {
+        var outcome = terminalSessionOutcome(session.outcome);
+        if (outcome) { label = outcome.label; detail = outcome.detail; }
+      }
+      if (isActive && (label === 'Idle' || label === 'Waiting' || label === 'Interrupted' || !current || current.type === 'idle')) {
+        label = 'Running';
+        detail = 'Running';
+      }
+      detail = unicodePrefix(detail, 512);
+      var title = state.nicknames[id] || titleOf(session);
+      var props = {
+        name: { shortText: { text: unicodePrefix(title, 7) }, longText: { text: title } },
+        session_id: { longText: { text: id } },
+        status: { shortText: { text: label }, longText: { text: detail } },
+        detail: { longText: { text: detail } },
+        url: { longText: { text: sessionURL(state.url, id) } }
+      };
+      if (toolName) props.tool = { longText: { text: toolName } };
+      if (retryAt !== null) props.retry_at = { timestamp: { value: Math.floor(retryAt / 1000) } };
+      if (session.time && typeof session.time.updated === 'number' && Number.isFinite(session.time.updated) && session.time.updated >= 0) props.updated = { timestamp: { value: Math.floor(session.time.updated / 1000) } };
+      return { validUntilMs: now() + 20000, instances: [{ instanceId: id, properties: props }] };
+    }
+
+    function inboxItemValid(item, id) {
+      if (!isPlainObject(item) || !/^msg_[A-Za-z0-9_-]{1,196}$/.test(item.id) || item.sessionID !== id ||
+          ['user', 'synthetic', 'compaction', 'move'].indexOf(item.type) === -1 || !isPlainObject(item.time) ||
+          typeof item.time.created !== 'number' || !Number.isFinite(item.time.created) || item.time.created < 0 ||
+          !validDelivery(item.delivery) || item.payload === undefined || item.payload === null) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid inbox data.');
+      if ((item.type === 'user' || item.type === 'synthetic') && (!isPlainObject(item.payload) || typeof item.payload.text !== 'string' ||
+          !validUnicodeString(item.payload.text) || item.payload.text.length > 1048576)) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid inbox data.');
+      if (item.type === 'move' && !isPlainObject(item.payload)) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid inbox data.');
+      return item;
+    }
+
+    function validateInboxList(data, id) {
+      if (!Array.isArray(data) || data.length > 200) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid inbox data.');
+      var seen = Object.create(null);
+      return data.map(function (item) {
+        item = inboxItemValid(item, id);
+        if (seen[item.id]) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned duplicate inbox data.');
+        seen[item.id] = true;
+        return item;
+      });
+    }
+
+    async function queueInstances(state) {
+      var ids = [];
+      var focus = focusedSessionID(state);
+      if (state.mode === 'default_chat' && state.selected && sessionID(state.selected.session_id)) ids.push(state.selected.session_id);
+      if (sessionID(state.lastSessionID) && ids.indexOf(state.lastSessionID) === -1) ids.push(state.lastSessionID);
+      else if (focus && ids.indexOf(focus) === -1) ids.push(focus);
+      if (ids.length > 2) ids = ids.slice(0, 2);
+      var all = [];
+      var seenComposite = Object.create(null);
+      var titles = Object.create(null);
+      for (var i = 0; i < ids.length; i += 1) {
+        var session = await getSession(state, ids[i]);
+        if (archived(session)) continue;
+        titles[ids[i]] = state.nicknames[ids[i]] || titleOf(session);
+        var response = await api(state, sessionPath(ids[i]) + '/inbox');
+        if (!response || !Array.isArray(response.data)) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid inbox data.');
+        if (response.data.length > 200 || all.length + response.data.length > 200) throw makeError('PLUGIN_UNAVAILABLE', 'Too many queued messages to inspect safely.');
+        validateInboxList(response.data, ids[i]).forEach(function (item) {
+          var key = item.sessionID + ':' + item.id;
+          if (seenComposite[key]) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned duplicate inbox data.');
+          seenComposite[key] = true;
+          var text = item.type === 'user' || item.type === 'synthetic' ? boundedDisplayText(item.payload.text, 4096) :
+            item.type === 'compaction' ? 'Compaction' : 'Session moved';
+          all.push({ item: item, text: text });
+        });
+      }
+      return { validUntilMs: now() + 20000, instances: all.map(function (entry) {
+        var item = entry.item;
+        var title = titles[item.sessionID];
+        title = typeof title === 'string' && validUnicodeString(title) ? boundedDisplayText(title, 4096) : 'OpenCode session';
+        return { instanceId: item.sessionID + ':' + item.id, properties: {
+          name: { shortText: { text: unicodePrefix(title, 7) }, longText: { text: title } },
+          session_id: { longText: { text: item.sessionID } }, inbox_id: { longText: { text: item.id } },
+          kind: { shortText: { text: item.type } }, text: { shortText: { text: unicodePrefix(entry.text, 7) }, longText: { text: entry.text } },
+          delivery: { shortText: { text: item.delivery } }, queued_at: { timestamp: { value: Math.floor(item.time.created / 1000) } },
+          url: { longText: { text: sessionURL(state.url, item.sessionID) } }
+        } };
+      }) };
+    }
+
+    async function shellInstances(state) {
+      var id = focusedSessionID(state);
+      var session = id ? await getSession(state, id) : null;
+      var directory = scopedLocation(state, session);
+      var response;
+      try { response = await api(state, '/shell' + locationQuery(directory)); }
+      catch (err) { if (err && (err.httpStatus === 404 || err.httpStatus === 405)) throw makeError('PLUGIN_UNAVAILABLE', 'Shell source is not supported by this OpenCode server.'); throw err; }
+      var shells = validateLocationResponse(response, directory, 'OpenCode returned invalid shell data.');
+      if (shells.length > 200) throw makeError('PLUGIN_UNAVAILABLE', 'Too many shells to inspect safely.');
+      var shellIDs = Object.create(null);
+      shells.forEach(function (shell) {
+        if (!isPlainObject(shell) || !/^sh_[A-Za-z0-9_-]{1,197}$/.test(shell.id) || shellIDs[shell.id] ||
+            ['running', 'exited', 'timeout', 'killed'].indexOf(shell.status) === -1 || typeof shell.command !== 'string' || shell.command.length > 65536 || !validUnicodeString(shell.command) ||
+            typeof shell.cwd !== 'string' || !validUnicodeString(shell.cwd) || !isPlainObject(shell.time) || typeof shell.time.started !== 'number' ||
+            !Number.isFinite(shell.time.started) || shell.time.started < 0 ||
+            shell.time.completed !== undefined && (typeof shell.time.completed !== 'number' || !Number.isFinite(shell.time.completed) || shell.time.completed < 0) ||
+            shell.exit !== undefined && (typeof shell.exit !== 'number' || !Number.isFinite(shell.exit))) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid shell data.');
+        shellIDs[shell.id] = true;
+      });
+      return { validUntilMs: now() + 20000, instances: shells.filter(function (shell) { return shell && shell.status === 'running'; }).map(function (shell) {
+        var props = {
+          name: { shortText: { text: unicodePrefix(boundedDisplayText(shell.command, 4096), 7) }, longText: { text: boundedDisplayText(shell.command, 4096) } }, shell_id: { longText: { text: shell.id } },
+          command: { longText: { text: boundedDisplayText(shell.command, 4096) } }, directory: { longText: { text: directory } }, cwd: { longText: { text: boundedDisplayText(shell.cwd, 4096) } },
+          status: { shortText: { text: 'Running' }, longText: { text: shell.status } }, started: { timestamp: { value: Math.floor(shell.time.started / 1000) } },
+          duration: { numericValue: { value: Math.max(0, (now() - shell.time.started) / 1000), min: 0, unit: 's' }, shortText: { text: String(Math.max(0, (now() - shell.time.started) / 1000)) } }
+        };
+        if (typeof shell.time.completed === 'number') props.completed = { timestamp: { value: Math.floor(shell.time.completed / 1000) } };
+        if (typeof shell.exit === 'number') props.exit = { numericValue: { value: shell.exit } };
+        return { instanceId: shell.id, properties: props };
+      }) };
+    }
+
+    async function commandInstances(state) {
+      var id = focusedSessionID(state);
+      var session = id ? await getSession(state, id) : null;
+      var directory = scopedLocation(state, session);
+      var response;
+      try { response = await api(state, '/command' + locationQuery(directory)); }
+      catch (err) { if (err && (err.httpStatus === 404 || err.httpStatus === 405)) throw makeError('PLUGIN_UNAVAILABLE', 'Command source is not supported by this OpenCode server.'); throw err; }
+      var commands = validateCommandList(response, directory);
+      return { validUntilMs: now() + 300000, instances: commands.map(function (command) {
+        var displayName = boundedDisplayText(command.name, 200);
+        var props = { name: { shortText: { text: unicodePrefix(displayName, 7) }, longText: { text: displayName } }, command: { longText: { text: displayName } }, directory: { longText: { text: directory } } };
+        if (command.description) props.description = { longText: { text: boundedDisplayText(command.description, 4096) } };
+        if (id) props.session_id = { longText: { text: id } };
+        return { instanceId: command.name, properties: props };
+      }) };
+    }
+
+    async function inboxAction(state, args, changeDelivery) {
+      var allowed = changeDelivery ? ['session_id', 'inbox_id', 'delivery'] : ['session_id', 'inbox_id'];
+      if (!isPlainObject(args) || Object.keys(args).length !== allowed.length || Object.keys(args).some(function (key) { return allowed.indexOf(key) === -1; }) ||
+          !sessionID(args.session_id) || !/^msg_[A-Za-z0-9_-]{1,196}$/.test(args.inbox_id) || args.inbox_id === '.' || args.inbox_id === '..' ||
+          changeDelivery && !validDelivery(args.delivery)) {
+        throw makeError('INVALID_ARGS', 'Invalid queued message request.');
+      }
+      var session = await getSession(state, args.session_id);
+      if (archived(session)) throw makeError('INVALID_ARGS', 'Archived sessions cannot change queued messages.');
+      var response;
+      try { response = await api(state, sessionPath(session.id) + '/inbox'); }
+      catch (err) { if (err && err.httpStatus === 404) throw makeError('INVALID_ARGS', 'Queued message not found or already settled. Refresh first.'); throw err; }
+      if (!response || !Array.isArray(response.data)) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid inbox data.');
+      var found = validateInboxList(response.data, session.id).filter(function (item) { return item.id === args.inbox_id; });
+      if (found.length !== 1) throw makeError('INVALID_ARGS', 'Queued message not found or already settled. Refresh first.');
+      var route = sessionPath(session.id) + '/inbox/' + encodeURIComponent(args.inbox_id);
+      await invalidateBeforeMutation(state);
+      try {
+        if (changeDelivery) await api(state, route, 'PATCH', { delivery: args.delivery }, 204);
+        else await api(state, route, 'DELETE', undefined, 204);
+      } catch (err) {
+        if (err && (err.httpStatus === 404 || err.httpStatus === 409)) throw makeError('INVALID_ARGS', 'Queued message changed or already settled. Refresh first.');
+        if (err && (err.code === 'PERMISSION_DENIED' || err.code === 'AUTH_REQUIRED' || err.code === 'RATE_LIMITED')) throw err;
+        if (err && err.httpStatus && err.httpStatus < 500) throw err;
+        throw makeError('PLUGIN_UNAVAILABLE', 'Queued message change outcome uncertain. Inspect OpenCode before retrying.');
+      }
+      await invalidateAfterMutation(state);
+      return { text: changeDelivery ? 'Queued message delivery updated.' : 'Queued message cancelled.', refreshed: ['opencode/queue', 'opencode/execution', 'opencode/shell', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/chat_status', 'opencode/permission', 'opencode/question'] };
+    }
+
+    async function stopShellAction(state, args) {
+      if (!isPlainObject(args) || Object.keys(args).length !== 2 || !/^sh_[A-Za-z0-9_-]{1,197}$/.test(args.shell_id) || !directoryPath(args.directory)) throw makeError('INVALID_ARGS', 'Invalid shell request.');
+      var focusID = focusedSessionID(state);
+      var focused = focusID ? await getSession(state, focusID) : null;
+      var expected = scopedLocation(state, focused);
+      if (args.directory !== expected) throw makeError('INVALID_ARGS', 'Shell location does not match current session location.');
+      var route = '/shell/' + encodeURIComponent(args.shell_id) + locationQuery(expected);
+      var response;
+      try { response = await api(state, route); }
+      catch (err) { if (err && err.httpStatus === 404) throw makeError('INVALID_ARGS', 'Shell not found in this location.'); throw err; }
+      if (!isPlainObject(response) || !isPlainObject(response.location) || response.location.directory !== expected || !isPlainObject(response.data) ||
+          response.data.id !== args.shell_id || !['running', 'exited', 'timeout', 'killed'].includes(response.data.status)) throw makeError('PLUGIN_UNAVAILABLE', 'OpenCode returned invalid shell data.');
+      if (response.data.status !== 'running') throw makeError('INVALID_ARGS', 'Shell is no longer running.');
+      await invalidateBeforeMutation(state);
+      try { await api(state, route, 'DELETE', undefined, 204); }
+      catch (err) {
+        if (err && err.httpStatus === 404) throw makeError('INVALID_ARGS', 'Shell already stopped or removed.');
+        if (err && (err.code === 'PERMISSION_DENIED' || err.code === 'AUTH_REQUIRED' || err.code === 'RATE_LIMITED')) throw err;
+        if (err && err.httpStatus && err.httpStatus < 500) throw err;
+        throw makeError('PLUGIN_UNAVAILABLE', 'Shell stop outcome uncertain. Inspect OpenCode before retrying.');
+      }
+      await invalidateAfterMutation(state);
+      return { text: 'Shell stopped and removed. Removing shell also removes retained output.', refreshed: ['opencode/shell', 'opencode/execution', 'opencode/active_session', 'opencode/activity'] };
+    }
+
+    async function runCommandAction(state, args) {
+      if (!isPlainObject(args) || Object.keys(args).some(function (key) { return ['session_id', 'command', 'text', 'delivery'].indexOf(key) === -1; }) ||
+          !sessionID(args.session_id) || !validCommandName(args.command) ||
+          args.text !== undefined && (typeof args.text !== 'string' || args.text.length > 16000 || !validUnicodeString(args.text) || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/.test(args.text)) ||
+          args.delivery !== undefined && !validDelivery(args.delivery)) throw makeError('INVALID_ARGS', 'Invalid command request.');
+      var session = await getSession(state, args.session_id);
+      if (archived(session)) throw makeError('INVALID_ARGS', 'Archived sessions cannot run commands.');
+      var directory = session.location.directory;
+      if (!directoryPath(directory)) throw makeError('INVALID_ARGS', 'Session location is invalid.');
+      var response;
+      try { response = await api(state, '/command' + locationQuery(directory)); }
+      catch (err) { if (err && (err.httpStatus === 404 || err.httpStatus === 405)) throw makeError('PLUGIN_UNAVAILABLE', 'Commands are not supported by this OpenCode server.'); throw err; }
+      var commands = validateCommandList(response, directory);
+      var match = commands.filter(function (command) { return isPlainObject(command) && command.name === args.command; });
+      if (match.length !== 1) throw makeError('INVALID_ARGS', 'Command is no longer available in this session location.');
+      await invalidateBeforeMutation(state);
+      try {
+        await api(state, sessionPath(session.id) + '/command', 'POST', {
+          name: args.command, text: args.text === undefined ? '' : args.text,
+          delivery: args.delivery === undefined ? state.default_delivery : args.delivery
+        }, 204);
+      } catch (err) {
+        if (err && err.httpStatus === 404) throw makeError('INVALID_ARGS', 'Session or command was not found.');
+        if (err && (err.code === 'PERMISSION_DENIED' || err.code === 'AUTH_REQUIRED' || err.code === 'RATE_LIMITED')) throw err;
+        if (err && err.httpStatus && err.httpStatus < 500) throw err;
+        throw makeError('PLUGIN_UNAVAILABLE', 'Command outcome uncertain. Inspect OpenCode before retrying.');
+      }
+      await invalidateAfterMutation(state);
+      return { text: 'Command invocation sent to OpenCode.', refreshed: ['opencode/execution', 'opencode/queue', 'opencode/shell', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/chat_status', 'opencode/permission', 'opencode/question'] };
     }
 
     function validForm(form, id) {
@@ -1082,7 +1878,7 @@
     }
 
     function directoryPath(value) {
-      return typeof value === 'string' && !/[\u0000-\u001f\u007f]/.test(value) &&
+      return typeof value === 'string' && value.length <= 4096 && !/[\u0000-\u001f\u007f-\u009f]/.test(value) &&
         (/^\/(?:[^\u0000-\u001f\u007f]*)$/.test(value) || /^[A-Za-z]:[\\/]/.test(value) || /^\\\\[^\\]+\\[^\\]+/.test(value));
     }
 
@@ -1110,6 +1906,7 @@
           candidate.mode = 'default_chat';
         }
         candidate.version = version;
+        await invalidateSnapshotCache(candidate);
         await save(candidate);
         refresh();
         return status(candidate);
@@ -1140,13 +1937,14 @@
           pairCandidate.mode = 'default_chat';
         }
         pairCandidate.version = pairVersion;
+        await invalidateSnapshotCache(pairCandidate);
         await save(pairCandidate);
         refresh();
         return status(pairCandidate);
       }
 
       if (type === 'disconnect') {
-        try { await storage.removeItem(STATE_KEY); }
+        try { await storage.removeItem(STATE_KEY); await storage.removeItem(SNAPSHOT_CACHE_KEY); await storage.removeItem(LEGACY_CACHE_META_KEY); }
         catch (_) { throw makeError('PLUGIN_UNAVAILABLE', 'Secure storage is unavailable.'); }
         refresh();
         return status(emptyState());
@@ -1157,6 +1955,7 @@
         var tested = await api(state, '/info');
         var testedVersion = tested && tested.version;
         if (typeof testedVersion !== 'string' || !/^2\./.test(testedVersion)) throw makeError('INVALID_ARGS', 'OpenCode V2 server required.');
+        if (testedVersion !== state.version) await invalidateSnapshotCache(state);
         state.version = testedVersion;
         await save(state);
         return status(state);
@@ -1183,8 +1982,9 @@
       if (type === 'mode') {
         if (input.mode !== 'default_chat' && input.mode !== 'new_chat') throw makeError('INVALID_ARGS', 'Invalid mode.');
         state.mode = input.mode;
+        await invalidateSnapshotCache(state);
         await save(state);
-        refresh();
+        refresh(['agent/configured', 'opencode/reply', 'opencode/replies', 'opencode/chat_status', 'opencode/question', 'opencode/execution', 'opencode/queue', 'opencode/shell', 'opencode/command']);
         return status(state);
       }
 
@@ -1193,8 +1993,9 @@
           throw makeError('INVALID_ARGS', 'Reply session count must be a whole number from 1 to 20.');
         }
         state.reply_count = input.count;
+        await invalidateSnapshotCache(state);
         await save(state);
-        refresh();
+        refresh(['opencode/replies', 'opencode/chat_status']);
         return status(state);
       }
 
@@ -1208,8 +2009,9 @@
       if (type === 'directory') {
         if (!directoryPath(input.directory)) throw makeError('INVALID_ARGS', 'Directory must be an absolute server path.');
         state.directory = input.directory;
+        await invalidateSnapshotCache(state);
         await save(state);
-        refresh();
+        refresh(['agent/configured', 'agent/chats', 'opencode/shell', 'opencode/command']);
         return status(state);
       }
 
@@ -1220,8 +2022,9 @@
         if (archived(selected)) throw makeError('INVALID_ARGS', 'Archived sessions cannot be selected.');
         state.selected = { session_id: selected.id, title: titleOf(selected) };
         state.mode = 'default_chat';
+        await invalidateSnapshotCache(state);
         await save(state);
-        refresh();
+        refresh(['agent/configured', 'opencode/reply', 'opencode/replies', 'opencode/chat_status', 'opencode/question', 'opencode/execution', 'opencode/queue', 'opencode/shell', 'opencode/command']);
         return status(state);
       }
 
@@ -1239,8 +2042,9 @@
         });
         if (nickname) state.nicknames[input.session_id] = nickname;
         else delete state.nicknames[input.session_id];
+        await invalidateSnapshotCache(state);
         await save(state);
-        refresh();
+        refresh(['agent/chats', 'agent/configured', 'opencode/active_session', 'opencode/reply', 'opencode/replies', 'opencode/chat_status', 'opencode/permission', 'opencode/question', 'opencode/execution', 'opencode/queue']);
         return status(state);
       }
 
@@ -1251,7 +2055,7 @@
       if (!input || typeof input.category !== 'string' || typeof input.item !== 'string') {
         throw makeError('INVALID_REQUEST', 'Unsupported source request.');
       }
-      var state = await load();
+      var state = await sourceCacheState(await load());
       if (input.category === 'agent' && input.item === 'configured') {
         var name = state.mode === 'new_chat' ? DEFAULT_TITLE :
           (state.selected ? (state.nicknames[state.selected.session_id] || state.selected.title) : DEFAULT_TITLE);
@@ -1339,6 +2143,22 @@
         requireConnection(state);
         return { validUntilMs: now() + 20000, instances: await jobInstances(state) };
       }
+      if (input.category === 'opencode' && input.item === 'execution') {
+        requireConnection(state);
+        return await executionInstances(state);
+      }
+      if (input.category === 'opencode' && input.item === 'queue') {
+        requireConnection(state);
+        return await queueInstances(state);
+      }
+      if (input.category === 'opencode' && input.item === 'shell') {
+        requireConnection(state);
+        return await shellInstances(state);
+      }
+      if (input.category === 'opencode' && input.item === 'command') {
+        requireConnection(state);
+        return await commandInstances(state);
+      }
       if (input.category === 'opencode' && input.item === 'question') {
         requireConnection(state);
         return { validUntilMs: now() + 20000, instances: await questionInstances(state) };
@@ -1392,8 +2212,6 @@
       return false;
     }
 
-    var refreshedActions = ['agent/chats', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/chat_status', 'opencode/permission', 'opencode/question', 'opencode/job'];
-
     async function approvePermissionAction(state, args) {
       if (!isPlainObject(args)) throw makeError('INVALID_ARGS', 'Invalid permission response.');
       Object.keys(args).forEach(function (key) {
@@ -1421,6 +2239,7 @@
       }
       var body = { decision: decision };
       if (args.message) body.message = args.message;
+      await invalidateBeforeMutation(state);
       try {
         await api(state, sessionPath(args.session_id) + '/permission/' + encodeURIComponent(args.request_id) + '/reply', 'POST', body, 204);
       } catch (err) {
@@ -1431,9 +2250,10 @@
         if (err && err.httpStatus && err.httpStatus < 500) throw err;
         throw makeError('PLUGIN_UNAVAILABLE', 'Permission response uncertain. Inspect OpenCode before retrying.');
       }
+      await invalidateAfterMutation(state);
       return {
         text: (decision === 'once' ? 'Permission approved: ' : 'Permission rejected: ') + request.action,
-        refreshed: refreshedActions
+        refreshed: permissionRefreshes
       };
     }
 
@@ -1463,6 +2283,7 @@
       var session = await getSession(state, args.session_id);
       if (archived(session)) throw makeError('INVALID_ARGS', 'Archived sessions cannot be interrupted.');
       var response;
+      await invalidateBeforeMutation(state);
       try { response = await api(state, sessionPath(session.id) + '/interrupt?resume=false', 'POST'); }
       catch (err) {
         if (err && (err.code === 'PERMISSION_DENIED' || err.code === 'AUTH_REQUIRED' || err.code === 'RATE_LIMITED')) throw err;
@@ -1470,7 +2291,8 @@
         throw makeError('PLUGIN_UNAVAILABLE', 'Interrupt outcome uncertain. Inspect OpenCode before retrying.');
       }
       if (!response || typeof response.interrupted !== 'boolean') throw makeError('PLUGIN_UNAVAILABLE', 'Interrupt outcome uncertain. Inspect OpenCode before retrying.');
-      return { text: response.interrupted ? 'Interrupted OpenCode session: ' + titleOf(session) : 'OpenCode session is already idle: ' + titleOf(session), refreshed: refreshedActions };
+      await invalidateAfterMutation(state);
+      return { text: response.interrupted ? 'Interrupted OpenCode session: ' + titleOf(session) : 'OpenCode session is already idle: ' + titleOf(session), refreshed: interruptRefreshes };
     }
 
     function answerValue(value) {
@@ -1556,6 +2378,7 @@
       if (checked.external) throw makeError('INVALID_ARGS', 'This question requires external interaction and cannot be answered here.');
       if (checked.hiddenRequired) throw makeError('INVALID_ARGS', 'This question requires a hidden field; answer it in OpenCode desktop.');
       validateAnswer(detail, args.answer);
+      await invalidateBeforeMutation(state);
       try { await api(state, sessionPath(args.session_id) + '/form/' + encodeURIComponent(args.form_id) + '/reply', 'POST', { answer: args.answer }, 204); }
       catch (err) {
         if (err && err.httpStatus === 400) throw makeError('INVALID_ARGS', 'OpenCode rejected the answer. Refresh the question and check its fields.');
@@ -1565,18 +2388,23 @@
         if (err && err.httpStatus && err.httpStatus < 500) throw err;
         throw makeError('PLUGIN_UNAVAILABLE', 'Answer outcome uncertain. Inspect OpenCode before retrying.');
       }
-      return { text: 'Answer submitted to OpenCode.', refreshed: refreshedActions };
+      await invalidateAfterMutation(state);
+      return { text: 'Answer submitted to OpenCode.', refreshed: questionRefreshes };
     }
 
     async function action(input) {
-      if (input && ['interrupt_session', 'answer_question', 'approve_permission', 'mark_chat_read'].indexOf(input.action) !== -1) {
+      if (input && ['interrupt_session', 'answer_question', 'approve_permission', 'mark_chat_read', 'cancel_queued_message', 'set_queued_delivery', 'stop_shell', 'run_command'].indexOf(input.action) !== -1) {
         if (!input.args || typeof input.args !== 'object' || Array.isArray(input.args)) throw makeError('INVALID_ARGS', 'Invalid action request.');
         var controlState = await load();
         requireConnection(controlState);
         if (input.action === 'interrupt_session') return interruptAction(controlState, input.args);
         if (input.action === 'answer_question') return answerAction(controlState, input.args);
         if (input.action === 'approve_permission') return approvePermissionAction(controlState, input.args);
-        return markChatReadAction(controlState, input.args);
+        if (input.action === 'mark_chat_read') return markChatReadAction(controlState, input.args);
+        if (input.action === 'cancel_queued_message') return inboxAction(controlState, input.args, false);
+        if (input.action === 'set_queued_delivery') return inboxAction(controlState, input.args, true);
+        if (input.action === 'stop_shell') return stopShellAction(controlState, input.args);
+        return runCommandAction(controlState, input.args);
       }
       if (!input || typeof input !== 'object' || input.action !== 'send_to_agent' ||
           !input.args || typeof input.args !== 'object' || Array.isArray(input.args)) {
@@ -1634,6 +2462,7 @@
         if (archived(session)) throw makeError('INVALID_ARGS', 'Archived sessions cannot receive messages.');
       } else {
         if (!directoryPath(state.directory)) throw makeError('INVALID_ARGS', 'Set an absolute server directory before creating a session.');
+        await invalidateBeforeMutation(state);
         var created = await api(state, '/session', 'POST', { title: 'Pebble', location: { directory: state.directory } });
         session = validSession(created && created.data);
         if (archived(session)) throw makeError('INVALID_ARGS', 'Archived sessions cannot receive messages.');
@@ -1643,6 +2472,7 @@
       var receipt;
       var deliveryVerified = false;
       var receiptText = { sessionID: session.id, text: message };
+      await invalidateBeforeMutation(state);
       try {
         receipt = await api(state, sessionPath(session.id) + '/prompt', 'POST', {
           id: messageID, text: message, delivery: delivery
@@ -1679,9 +2509,10 @@
           await save(freshState);
         }
       } catch (_) { focusWarning = true; }
+      await invalidateAfterMutation(state);
       return {
         text: (delivery === 'steer' ? 'Message steered into OpenCode: ' : 'Message queued for OpenCode: ') + titleOf(session) + (focusWarning ? ' Focus not saved.' : ''),
-        refreshed: refreshedActions
+        refreshed: sourceRefreshes()
       };
     }
 

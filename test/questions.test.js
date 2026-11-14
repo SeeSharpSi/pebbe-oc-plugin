@@ -114,7 +114,7 @@ test('answer_question posts exact answer once after fresh pending detail and ref
   detail(h, 'ses_a', 'frm/a', fields);
   h.route('POST', '/api/session/ses_a/form/frm%2Fa/reply', req => { assert.deepEqual(req.body, { answer }); return response(null, 204); });
   const result = await action(h, { session_id: 'ses_a', form_id: 'frm/a', answer });
-  assert.deepEqual(result.refreshed, ['agent/chats', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/chat_status', 'opencode/permission', 'opencode/question', 'opencode/job']);
+  assert.deepEqual(result.refreshed, ['opencode/question', 'opencode/chat_status', 'opencode/active_session', 'opencode/activity', 'opencode/reply', 'opencode/replies', 'opencode/execution']);
   assert.equal(h.requests.filter(row => row.method === 'POST').length, 1);
   assert.ok(h.requests.every(row => row.method === 'GET' || row.method === 'POST'));
 });
