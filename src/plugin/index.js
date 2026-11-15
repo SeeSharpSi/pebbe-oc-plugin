@@ -130,6 +130,7 @@
     var cacheWriteChain = Promise.resolve();
     var sourceActiveMapInFlight = Object.create(null);
     var legacyCacheMetaInFlight = Object.create(null);
+    var snapshotCacheContexts = new WeakMap();
     if (!storage || typeof storage.getItem !== 'function' || typeof storage.setItem !== 'function' ||
         typeof storage.removeItem !== 'function' || typeof fetcher !== 'function') {
       throw new TypeError('storage and fetch are required');
@@ -171,28 +172,40 @@
       return String(now()) + '-' + String(random ? random() : Math.random().toString(36).slice(2)) + '-' + requestCounter;
     }
 
+    function clearSnapshotCacheContext(state) {
+      if (state && typeof state === 'object') snapshotCacheContexts.delete(state);
+    }
+
     async function invalidateSnapshotCache(state) {
       state.cache_generation = newCacheGeneration();
+      clearSnapshotCacheContext(state);
       try { await storage.removeItem(SNAPSHOT_CACHE_KEY); } catch (_) {}
       try { await storage.removeItem(LEGACY_CACHE_META_KEY); } catch (_) {}
     }
 
     async function invalidateAfterMutation(state) {
+      clearSnapshotCacheContext(state);
       try {
         var fresh = await load();
         if (fresh.url === state.url && fresh.username === state.username && fresh.password === state.password && fresh.version === state.version) {
           await invalidateSnapshotCache(fresh);
           await save(fresh);
-        } else await storage.removeItem(SNAPSHOT_CACHE_KEY);
+        } else {
+          clearSnapshotCacheContext(fresh);
+          await storage.removeItem(SNAPSHOT_CACHE_KEY);
+        }
       } catch (_) { try { await storage.removeItem(SNAPSHOT_CACHE_KEY); } catch (_) {} }
     }
 
     async function invalidateBeforeMutation(state) {
+      clearSnapshotCacheContext(state);
       var fresh = await load();
       if (fresh.url !== state.url || fresh.username !== state.username || fresh.password !== state.password || fresh.version !== state.version) {
+        clearSnapshotCacheContext(fresh);
         throw makeError('PLUGIN_UNAVAILABLE', 'Connection changed before mutation. Refresh and retry.');
       }
       fresh.cache_generation = newCacheGeneration();
+      clearSnapshotCacheContext(fresh);
       await save(fresh);
       try { await storage.removeItem(SNAPSHOT_CACHE_KEY); } catch (_) {}
     }
@@ -233,7 +246,7 @@
       if (state.cache_generation || !state.url || !state.username || !state.password || !/^2\./.test(state.version) ||
           state.url.length > 1500 || state.username.length > 200 || state.version.length > 64) return state;
       var identity = state.url + '\n' + state.username + '\n' + state.version;
-      if (legacyCacheMetaInFlight[identity]) return legacyCacheMetaInFlight[identity];
+      if (legacyCacheMetaInFlight[identity]) return Object.assign({}, await legacyCacheMetaInFlight[identity]);
       var pending = (async function () {
         try {
           var rawMeta = await storage.getItem(LEGACY_CACHE_META_KEY);
@@ -256,14 +269,16 @@
         } catch (_) { return state; }
       })();
       legacyCacheMetaInFlight[identity] = pending;
-      try { return await pending; }
+      try { return Object.assign({}, await pending); }
       finally { if (legacyCacheMetaInFlight[identity] === pending) delete legacyCacheMetaInFlight[identity]; }
     }
 
     async function readCacheEnvelope(state) {
       if (!state.cache_generation) return null;
+      var raw;
+      try { raw = await storage.getItem(SNAPSHOT_CACHE_KEY); }
+      catch (_) { return undefined; }
       try {
-        var raw = await storage.getItem(SNAPSHOT_CACHE_KEY);
         if (raw === null || raw === undefined) return null;
         var serialized = typeof raw === 'string' ? raw : JSON.stringify(raw);
         if (typeof serialized !== 'string' || serializedByteLength(serialized) > MAX_CACHE_BYTES) return null;
@@ -302,9 +317,34 @@
       return bytes;
     }
 
+    function memoizedCacheEnvelope(state) {
+      var context = snapshotCacheContexts.get(state);
+      if (context) {
+        if (context.loaded) return Promise.resolve(context.envelope);
+        if (context.pending) return context.pending;
+      }
+      var pending = readCacheEnvelope(state).then(function (envelope) {
+        var current = snapshotCacheContexts.get(state);
+        if (current && current.pending === pending) {
+          if (envelope !== undefined) snapshotCacheContexts.set(state, { loaded: true, envelope: envelope });
+          else snapshotCacheContexts.delete(state);
+        }
+        return envelope === undefined ? null : envelope;
+      }, function () {
+        var current = snapshotCacheContexts.get(state);
+        if (current && current.pending === pending) snapshotCacheContexts.delete(state);
+        return null;
+      });
+      snapshotCacheContexts.set(state, { loaded: false, pending: pending });
+      return pending;
+    }
+
     async function readSnapshotCache(state, name) {
-      if (!await persistedGenerationMatches(state)) return null;
-      var cache = await readCacheEnvelope(state);
+      if (!await persistedGenerationMatches(state)) {
+        clearSnapshotCacheContext(state);
+        return null;
+      }
+      var cache = await memoizedCacheEnvelope(state);
       var entry = cache && cache.entries[name];
       return entry && entry.expires > now() ? entry.value : null;
     }
@@ -327,9 +367,16 @@
       if (!state.cache_generation) return Promise.resolve();
       var task = cacheWriteChain.then(async function () {
         try {
-          if (!await persistedGenerationMatches(state)) return;
-          var cache = await readCacheEnvelope(state);
-          if (!cache) cache = { version: 1, generation: state.cache_generation, url: state.url, username: state.username, entries: {} };
+          if (!await persistedGenerationMatches(state)) {
+            clearSnapshotCacheContext(state);
+            return;
+          }
+          var cached = await readCacheEnvelope(state);
+          if (cached === undefined) return;
+          var cache = {
+            version: 1, generation: state.cache_generation, url: state.url, username: state.username,
+            entries: cached ? Object.assign({}, cached.entries) : {}
+          };
           var current = now();
           Object.keys(cache.entries).forEach(function (key) {
             if (cache.entries[key].expires <= current) delete cache.entries[key];
@@ -345,13 +392,20 @@
             delete cache.entries[oldest];
             serialized = serialize();
           }
-          if (serializedByteLength(serialized) > MAX_CACHE_BYTES || !await persistedGenerationMatches(state)) return;
+          if (serializedByteLength(serialized) > MAX_CACHE_BYTES) return;
+          if (!await persistedGenerationMatches(state)) {
+            clearSnapshotCacheContext(state);
+            return;
+          }
           await storage.setItem(SNAPSHOT_CACHE_KEY, serialized);
           if (!await persistedGenerationMatches(state)) {
+            clearSnapshotCacheContext(state);
             var after = await readCacheEnvelope(state);
             if (after && after.generation === state.cache_generation) await storage.removeItem(SNAPSHOT_CACHE_KEY);
+            return;
           }
-        } catch (_) {}
+          snapshotCacheContexts.set(state, { loaded: true, envelope: cache });
+        } catch (_) { clearSnapshotCacheContext(state); }
       });
       cacheWriteChain = task.catch(function () {});
       return task;

@@ -16,6 +16,50 @@ function setConnected(h, extra = {}) {
   });
 }
 
+function countCacheReads(h) {
+  const counter = { count: 0 };
+  const original = h.storage.getItem.bind(h.storage);
+  h.storage.getItem = async key => {
+    const value = await original(key);
+    if (key === CACHE) counter.count += 1;
+    return value;
+  };
+  return counter;
+}
+
+function readCache(h) {
+  const raw = h.storage.values.get(CACHE);
+  return typeof raw === 'string' ? JSON.parse(raw) : raw;
+}
+
+function writeCache(h, cache) {
+  h.storage.values.set(CACHE, JSON.stringify(cache));
+}
+
+function addFreshReplyRoutes(h, ids) {
+  ids.forEach((id, index) => h.route('GET', req => req.path === `/api/session/${id}/message`, response({
+    data: [{ id: `msg_fresh_${index}`, type: 'assistant', time: { created: 900, completed: 1000 }, content: [{ type: 'text', text: `fresh ${index}` }] }], cursor: { next: null }
+  })));
+}
+
+function addActiveRoutes(h, count = 20) {
+  for (let index = 0; index < count; index += 1) h.route('GET', '/api/session/active', response({ data: {} }));
+}
+
+async function populateWarmReplies(h, ids) {
+  const rows = ids.map(id => session(id, id, { time: { created: 1, updated: 1005 } }));
+  setConnected(h, { reply_count: ids.length, selected: { session_id: ids[0], title: ids[0] } });
+  h.route('GET', '/api/session', response(page(rows)));
+  ids.forEach((id, index) => h.route('GET', req => req.path === `/api/session/${id}/message`, response({
+    data: [{ id: `msg_${id}`, type: 'assistant', time: { created: 900, completed: 1000 }, content: [{ type: 'text', text: `reply ${index}` }] }], cursor: { next: null }
+  })));
+  await h.service.source({ category: 'opencode', item: 'replies' });
+  const cache = readCache(h);
+  cache.entries['active-map'] = { expires: 1700000060000, written: 1700000000000, value: { ids: [] } };
+  writeCache(h, cache);
+  return { rows, cache };
+}
+
 test('active snapshot shares in-flight scan within one plugin instance', async () => {
   const h = harness();
   setConnected(h);
@@ -313,6 +357,141 @@ test('twenty completed reply cache hits share one active-map read and fit bounde
   assert.equal(h.requests.filter(req => req.path === '/api/session/active').length, 1);
   assert.equal(h.requests.filter(req => req.path.includes('/message')).length, 20);
   assert.ok(Buffer.byteLength(String(h.storage.values.get(CACHE)), 'utf8') <= 262144);
+});
+
+test('warm completed reply cache reads CACHE once per source call', async () => {
+  const h = harness();
+  const ids = Array.from({ length: 20 }, (_, index) => `ses_warm${index}`);
+  await populateWarmReplies(h, ids);
+  const reads = countCacheReads(h);
+
+  const first = await h.service.source({ category: 'opencode', item: 'replies' });
+  assert.equal(first.instances.length, 20);
+  assert.deepEqual(h.unexpected, []);
+  assert.equal(reads.count, 1);
+
+  reads.count = 0;
+  const second = await h.service.source({ category: 'opencode', item: 'replies' });
+  assert.equal(second.instances.length, 20);
+  assert.equal(reads.count, 1);
+});
+
+test('concurrent warm source calls keep isolated request cache contexts', async () => {
+  const h = harness();
+  const ids = Array.from({ length: 20 }, (_, index) => `ses_parallel${index}`);
+  await populateWarmReplies(h, ids);
+  const reads = countCacheReads(h);
+
+  const [left, right] = await Promise.all([
+    h.service.source({ category: 'opencode', item: 'replies' }),
+    h.service.source({ category: 'opencode', item: 'replies' })
+  ]);
+  assert.equal(left.instances.length, 20);
+  assert.equal(right.instances.length, 20);
+  assert.deepEqual(h.unexpected, []);
+  assert.equal(reads.count, 2);
+});
+
+test('cache writes merge persisted entries written by a concurrent request', async () => {
+  const h = harness();
+  setConnected(h, { mode: 'new_chat', selected: null, lastSessionID: 'ses_merge', reply_count: 1 });
+  writeCache(h, {
+    version: 1, generation: 'gen', url: 'http://localhost:4096', username: 'opencode',
+    entries: {
+      'sessions:first': { expires: 1700000060000, written: 1700000000000, value: page([session('ses_merge', 'Merge', { time: { created: 1, updated: 1005 } })]) },
+      'active-map': { expires: 1700000060000, written: 1700000000000, value: { ids: [] } }
+    }
+  });
+  let entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let gated = false;
+  h.route('GET', req => req.path === '/api/session/ses_merge/message', async () => {
+    if (!gated) { gated = true; entered(); await gate; }
+    return response({ data: [{ id: 'msg_merge', type: 'assistant', time: { created: 900, completed: 1000 }, content: [{ type: 'text', text: 'merged reply' }] }], cursor: { next: null } });
+  });
+
+  const pending = h.service.source({ category: 'opencode', item: 'replies' });
+  await started;
+  h.route('GET', '/api/session/active', response({ data: {} }));
+  await h.service.source({ category: 'opencode', item: 'active_session' });
+  release();
+
+  const result = await pending;
+  assert.equal(result.instances[0].properties.text.longText.text, 'merged reply');
+  const cache = readCache(h);
+  assert.ok(cache.entries.active, 'concurrent active snapshot entry was dropped');
+  assert.ok(cache.entries['reply:ses_merge'], 'reply entry missing after merge');
+});
+
+test('generation rotation or disconnect during a request drops the memoized envelope', async t => {
+  for (const mode of ['rotate', 'disconnect']) {
+    await t.test(mode, async () => {
+      const h = harness();
+      const ids = Array.from({ length: 20 }, (_, index) => `ses_${mode}${index}`);
+      await populateWarmReplies(h, ids);
+      const messagesBefore = h.requests.filter(req => req.path.endsWith('/message')).length;
+      addFreshReplyRoutes(h, ids);
+      addActiveRoutes(h);
+
+      const original = h.storage.getItem.bind(h.storage);
+      let mutated = false;
+      h.storage.getItem = async key => {
+        const value = await original(key);
+        if (key === CACHE && !mutated) {
+          mutated = true;
+          if (mode === 'rotate') {
+            const state = h.storage.values.get(STATE);
+            h.storage.values.set(STATE, { ...(typeof state === 'string' ? JSON.parse(state) : state), cache_generation: 'gen-rotated' });
+          } else {
+            h.storage.values.delete(STATE);
+          }
+        }
+        return value;
+      };
+
+      const result = await h.service.source({ category: 'opencode', item: 'replies' });
+      assert.equal(result.instances.length, 20);
+      assert.deepEqual(result.instances.map(instance => instance.properties.text.longText.text), ids.map((_, index) => `fresh ${index}`));
+      assert.equal(h.requests.filter(req => req.path.endsWith('/message')).length - messagesBefore, 20);
+      if (mode === 'rotate') {
+        assert.equal(readCache(h).generation, 'gen');
+        const state = h.storage.values.get(STATE);
+        assert.equal((typeof state === 'string' ? JSON.parse(state) : state).cache_generation, 'gen-rotated');
+      } else {
+        assert.equal(h.storage.values.has(STATE), false);
+      }
+    });
+  }
+});
+
+test('cache expiry is checked with the current clock inside one request', async () => {
+  const h = harness();
+  const ids = Array.from({ length: 20 }, (_, index) => `ses_expired${index}`);
+  const { rows } = await populateWarmReplies(h, ids);
+  const pagesBefore = h.requests.filter(req => req.path === '/api/session').length;
+  h.route('GET', '/api/session', response(page(rows)));
+  addFreshReplyRoutes(h, ids);
+  addActiveRoutes(h);
+
+  const original = h.storage.getItem.bind(h.storage);
+  let advanced = false;
+  h.storage.getItem = async key => {
+    const value = await original(key);
+    if (key === CACHE && !advanced) {
+      advanced = true;
+      h.setNow(1700000060001);
+    }
+    return value;
+  };
+
+  const result = await h.service.source({ category: 'opencode', item: 'replies' });
+  assert.equal(result.instances.length, 20);
+  assert.deepEqual(result.instances.map(instance => instance.properties.text.longText.text), ids.map((_, index) => `fresh ${index}`));
+  assert.equal(h.requests.filter(req => req.path === '/api/session').length - pagesBefore, 1);
+  const entry = readCache(h).entries['reply:' + ids[0]];
+  assert.equal(entry.expires, 1700000120001);
 });
 
 test('active session bypasses completed reply cache and refreshes messages', async () => {
