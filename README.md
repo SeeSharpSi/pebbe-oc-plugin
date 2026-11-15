@@ -17,7 +17,7 @@ OpenCode sources expose activity, replies, chat attention, permissions, question
 
 | Source | Items and properties | Multiple | Refresh |
 | --- | --- | --- | ---: |
-| `opencode/active_session` | `name: shortText, longText`; `title: longText`; `status: shortText, longText`; `directory: longText`; `agent: longText`; `model: longText`; `updated: timestamp`; `url: longText`; `is_subagent: boolean`; metrics below | Yes | 20 sec |
+| `opencode/active_session` | `name: shortText, longText`; `title: longText`; `status: shortText, longText`; `directory: longText`; `agent: longText`; `model: longText`; `updated: timestamp`; `url: longText`; `is_subagent: boolean`; `root_session_id: longText`; `parent_session_id: longText` (children only); metrics below | Yes | 20 sec |
 | `opencode/activity` | `name: shortText, longText`; `active_count: numericValue, shortText`; `attention_count: numericValue, shortText`; `summary: shortText, longText`; `connected: boolean`; `checked_at: timestamp` | No | 20 sec |
 | `opencode/reply` | `name: shortText, longText`; `session_id: longText`; `message_id: longText`; `text: shortText, longText`; `updated: timestamp`; `complete: boolean`; `status: shortText, longText`; `url: longText`; metrics below | No | 20 sec |
 | `opencode/replies` | `name: shortText, longText`; `title: longText`; `session_id: longText`; `message_id: longText`; `text: shortText, longText`; `updated: timestamp`; `complete: boolean`; `status: shortText, longText`; `is_default: boolean`; `url: longText`; metrics below | Yes | 60 sec |
@@ -49,7 +49,7 @@ Pebble.subscribeToSource({
 });
 ```
 
-`active_session` yields each active session, including subagents. A session's `name` is its nickname or title; its actual session ID remains targetable with `send_to_agent`. `agent`, `model`, and `updated` may be absent. Status precedence is `Waiting for approval` when any permission request exists, then `Waiting for input` when forms exist, otherwise `Running`. `updated` and `checked_at` are Pebble timestamps in epoch seconds, converted from OpenCode milliseconds.
+`active_session` yields each active session, including subagents. `root_session_id` identifies the root of that session's ancestry, including the session itself for roots. Child sessions also expose their immediate `parent_session_id`; roots omit that property. These IDs derive from the ancestry already resolved for active-session grouping. A session's `name` is its nickname or title; its actual session ID remains targetable with `send_to_agent`. `agent`, `model`, and `updated` may be absent. Status precedence is `Waiting for approval` when any permission request exists, then `Waiting for input` when forms exist, otherwise `Running`. `updated` and `checked_at` are Pebble timestamps in epoch seconds, converted from OpenCode milliseconds.
 
 Active sessions represent foreground execution owned by the configured OpenCode process. They are not recent chats, background jobs, or activity in separate processes. Sessions are grouped by full root lineage in deterministic ancestry-ID order, parent before descendants. Inactive ancestors may be fetched for grouping but are not emitted as active sessions. `activity` counts root groups, not child-inclusive session instances. `attention_count` counts each root group once if any active member needs permission or input; a group with multiple requests still counts once.
 

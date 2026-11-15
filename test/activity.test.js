@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const manifest = require('../package.json').pebble;
 const { harness: newHarness, response, session, connected } = require('./helpers');
+const { createService } = require('../src/plugin/index.js');
 
 const activeHarnesses = [];
 function harness() { const h = newHarness(); activeHarnesses.push(h); return h; }
@@ -30,7 +31,8 @@ test('manifest appends activity sources without changing agent source declaratio
     properties: {
       name: ['shortText', 'longText'], title: ['longText'], status: ['shortText', 'longText'],
       directory: ['longText'], agent: ['longText'], model: ['longText'], updated: ['timestamp'],
-      url: ['longText'], is_subagent: ['boolean'], outcome: ['shortText', 'longText'], cost: ['numericValue', 'shortText'],
+      url: ['longText'], is_subagent: ['boolean'], root_session_id: ['longText'], parent_session_id: ['longText'],
+      outcome: ['shortText', 'longText'], cost: ['numericValue', 'shortText'],
       tokens_input: ['numericValue'], tokens_output: ['numericValue'], tokens_reasoning: ['numericValue'],
       tokens_cache_read: ['numericValue'], tokens_cache_write: ['numericValue']
     }, supportsMultiple: true, callerPermissions: [], suggestedRefreshIntervalSec: 20
@@ -76,6 +78,8 @@ test('active row maps live metadata fields, provider/model, URL, and epoch secon
   assert.equal(props.model.longText.text, 'anthropic/claude');
   assert.equal(props.updated.timestamp.value, 1700000123);
   assert.equal(props.is_subagent.boolean.value, false);
+  assert.equal(props.root_session_id.longText.text, 'ses_live');
+  assert.equal(props.parent_session_id, undefined);
   assert.equal(props.status.shortText.text, 'Running');
   assert.equal(props.url.longText.text, `http://localhost:4096/server/${Buffer.from('http://localhost:4096').toString('base64url')}/session/ses_live`);
 });
@@ -91,6 +95,8 @@ test('metadata memoizes shared ancestry and orders parent before child independe
   assert.deepEqual(result.instances.map(item => item.instanceId), ['ses_a', 'ses_b', 'ses_c']);
   assert.equal(h.requests.filter(req => req.path === '/api/session/ses_root').length, 1);
   assert.equal(result.instances.every(item => item.properties.is_subagent.boolean.value), true);
+  assert.equal(result.instances.every(item => item.properties.root_session_id.longText.text === 'ses_root'), true);
+  assert.equal(result.instances.every(item => item.properties.parent_session_id.longText.text === 'ses_root'), true);
   assert.equal(result.instances.some(item => item.instanceId === 'ses_root'), false);
 });
 
@@ -111,6 +117,8 @@ test('permuted multi-level lineages keep ancestry order stable across metadata c
   const second = await source(h);
   assert.deepEqual(first.instances.map(item => item.instanceId), ['ses_root', 'ses_zchild', 'ses_grand', 'ses_unrelated']);
   assert.deepEqual(second.instances.map(item => item.instanceId), first.instances.map(item => item.instanceId));
+  assert.deepEqual(first.instances.map(item => item.properties.root_session_id.longText.text), ['ses_root', 'ses_root', 'ses_root', 'ses_unrelated']);
+  assert.deepEqual(first.instances.map(item => item.properties.parent_session_id && item.properties.parent_session_id.longText.text), [undefined, 'ses_root', 'ses_zchild', undefined]);
   assert.equal(h.requests.filter(req => req.path === '/api/session/ses_root').length, 2);
   assert.equal(h.requests.filter(req => req.path === '/api/session/ses_zchild').length, 2);
 });
@@ -147,6 +155,8 @@ test('active child with inactive parent emits child only and counts its lineage'
   const sessions = await source(h);
   assert.deepEqual(sessions.instances.map(item => item.instanceId), ['ses_child']);
   assert.equal(sessions.instances[0].properties.is_subagent.boolean.value, true);
+  assert.equal(sessions.instances[0].properties.root_session_id.longText.text, 'ses_parent');
+  assert.equal(sessions.instances[0].properties.parent_session_id.longText.text, 'ses_parent');
   addActive(h, activeMap('ses_child')); addMetadata(h, 'ses_parent');
   addMetadata(h, 'ses_child', live('ses_child', { parentID: 'ses_parent' })); addPending(h, 'ses_child');
   const activity = await source(h, 'activity');
@@ -158,6 +168,94 @@ test('multiple unrelated active roots each count once', async () => {
   for (const id of ['ses_a', 'ses_b']) { addMetadata(h, id); addPending(h, id); }
   const activity = await source(h, 'activity');
   assert.equal(activity.instances[0].properties.active_count.numericValue.value, 2);
+  addActive(h, activeMap('ses_b', 'ses_a'));
+  for (const id of ['ses_a', 'ses_b']) { addMetadata(h, id); addPending(h, id); }
+  const instances = (await source(h)).instances;
+  assert.deepEqual(instances.map(item => item.properties.root_session_id.longText.text), ['ses_a', 'ses_b']);
+  assert.ok(instances.every(item => item.properties.parent_session_id === undefined));
+});
+
+test('active ancestry properties survive service recreation through the snapshot cache', async () => {
+  const h = harness(); await ready(h); addActive(h, activeMap('ses_grand', 'ses_root', 'ses_child'));
+  addMetadata(h, 'ses_root', live('ses_root'));
+  addMetadata(h, 'ses_child', live('ses_child', { parentID: 'ses_root' }));
+  addMetadata(h, 'ses_grand', live('ses_grand', { parentID: 'ses_child' }));
+  for (const id of ['ses_root', 'ses_child', 'ses_grand']) addPending(h, id);
+  const first = (await source(h)).instances;
+
+  let networkCalls = 0;
+  const recreated = createService({ storage: h.storage, now: () => 1700000000000, fetch: async () => {
+    networkCalls += 1;
+    throw new Error('cache hit unexpectedly made a request');
+  } });
+  const second = (await recreated.source({ category: 'opencode', item: 'active_session' })).instances;
+  const ancestry = items => items.map(item => [
+    item.instanceId,
+    item.properties.root_session_id.longText.text,
+    item.properties.parent_session_id && item.properties.parent_session_id.longText.text
+  ]);
+  assert.deepEqual(ancestry(second), ancestry(first));
+  assert.deepEqual(ancestry(second), [
+    ['ses_root', 'ses_root', undefined],
+    ['ses_child', 'ses_root', 'ses_root'],
+    ['ses_grand', 'ses_root', 'ses_child']
+  ]);
+  assert.equal(networkCalls, 0);
+});
+
+test('inconsistent cached ancestry falls back to a live bounded scan', async t => {
+  const corruptions = [
+    ['duplicate path IDs', (details) => {
+      const child = details.find(detail => detail.session.id === 'ses_child');
+      child.path = ['ses_root', 'ses_root', 'ses_child'];
+    }],
+    ['detail parent differs from path parent', (details) => {
+      const child = details.find(detail => detail.session.id === 'ses_child');
+      child.parentID = 'ses_forged';
+      child.session.parentID = 'ses_forged';
+    }],
+    ['safe session parent differs from detail parent', (details) => {
+      details.find(detail => detail.session.id === 'ses_child').session.parentID = 'ses_forged';
+    }],
+    ['root path carries a parent', (details) => {
+      const root = details.find(detail => detail.session.id === 'ses_root');
+      root.parentID = 'ses_forged';
+      root.session.parentID = 'ses_forged';
+    }]
+  ];
+
+  for (const [label, corrupt] of corruptions) await t.test(label, async () => {
+    const h = harness(); await ready(h);
+    const addTree = () => {
+      addActive(h, activeMap('ses_grand', 'ses_root', 'ses_child'));
+      addMetadata(h, 'ses_root', live('ses_root'));
+      addMetadata(h, 'ses_child', live('ses_child', { parentID: 'ses_root' }));
+      addMetadata(h, 'ses_grand', live('ses_grand', { parentID: 'ses_child' }));
+      for (const id of ['ses_root', 'ses_child', 'ses_grand']) addPending(h, id);
+    };
+    addTree();
+    await source(h);
+
+    const raw = h.storage.values.get('opencode.plugin.cache.v1');
+    const cache = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    corrupt(cache.entries.active.value.sessions);
+    h.storage.values.set('opencode.plugin.cache.v1', JSON.stringify(cache));
+
+    addTree();
+    const result = (await source(h)).instances;
+    assert.equal(h.requests.filter(req => req.path === '/api/session/active').length, 2, 'bad cache did not trigger exactly one fresh active-map lookup');
+    const ancestry = result.map(item => [
+      item.instanceId,
+      item.properties.root_session_id.longText.text,
+      item.properties.parent_session_id && item.properties.parent_session_id.longText.text
+    ]);
+    assert.deepEqual(ancestry, [
+      ['ses_root', 'ses_root', undefined],
+      ['ses_child', 'ses_root', 'ses_root'],
+      ['ses_grand', 'ses_root', 'ses_child']
+    ]);
+    assert.equal(JSON.stringify(ancestry).includes('ses_forged'), false, 'corrupt cache invented ancestry');
+  });
 });
 
 test('permission has status precedence over form; both waiting types group once', async () => {

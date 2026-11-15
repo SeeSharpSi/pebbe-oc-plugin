@@ -841,11 +841,17 @@
             var restored = cached.sessions.map(function (detail, index) {
                 if (!isPlainObject(detail) || !isPlainObject(detail.session) || !sessionID(detail.session.id) ||
                     !Array.isArray(detail.path) || !detail.path.length || detail.path.length > 33 || !detail.path.every(sessionID) ||
+                    detail.path.some(function (id, pathIndex) { return detail.path.indexOf(id) !== pathIndex; }) ||
                     detail.path[detail.path.length - 1] !== detail.session.id ||
                     (detail.parentID !== null && detail.parentID !== undefined && !sessionID(detail.parentID)) ||
                     (detail.attention !== null && ['permission', 'form'].indexOf(detail.attention) === -1) || cached.attention[index] !== detail.attention) throw new Error('invalid');
                 validSession(detail.session);
-                return { session: detail.session, parentID: detail.parentID || null, path: detail.path, attention: detail.attention };
+                var parentID = detail.parentID === undefined || detail.parentID === null ? null : detail.parentID;
+                var sessionParentID = detail.session.parentID === undefined || detail.session.parentID === null ? null : detail.session.parentID;
+                if (detail.path.length === 1) {
+                  if (parentID !== null || sessionParentID !== null) throw new Error('invalid');
+                } else if (detail.path[detail.path.length - 2] !== parentID || sessionParentID !== parentID) throw new Error('invalid');
+                return { session: detail.session, parentID: parentID, path: detail.path, attention: detail.attention };
             });
             if (!cached.roots.every(sessionID) || !cached.attentionRoots.every(sessionID) ||
                 cached.roots.some(function (id, i) { return cached.roots.indexOf(id) !== i; }) ||
@@ -893,8 +899,10 @@
         status: { shortText: { text: statusText }, longText: { text: statusLong } },
         directory: { longText: { text: session.location.directory } },
         url: { longText: { text: sessionURL(state.url, session.id) } },
-        is_subagent: { boolean: { value: Boolean(detail.parentID) } }
+        is_subagent: { boolean: { value: Boolean(detail.parentID) } },
+        root_session_id: { longText: { text: detail.path[0] } }
       };
+      if (detail.parentID) properties.parent_session_id = { longText: { text: detail.parentID } };
       if (typeof session.agent === 'string') properties.agent = { longText: { text: session.agent } };
       if (session.model && typeof session.model.providerID === 'string' && session.model.providerID &&
           typeof session.model.id === 'string' && session.model.id) {
