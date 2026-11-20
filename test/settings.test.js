@@ -59,29 +59,33 @@ function setup(initialState) {
       if (target !== 'plugin') throw new Error(`Unexpected message target ${target}`);
       switch (message.type) {
         case 'status':
-          return { connected: true, configured: state.mode === 'new_chat' ? Boolean(state.directory) : Boolean(state.selected), url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames }, reply_count: state.reply_count || 10, default_delivery: state.default_delivery || 'queue', auth_method: state.auth_method || '' };
+          return { connected: true, configured: state.mode === 'new_chat' ? Boolean(state.directory) : Boolean(state.selected), url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames }, reply_count: state.reply_count || 10, default_delivery: state.default_delivery || 'queue', auth_method: state.auth_method || '', reply_alerts: Boolean(state.reply_alerts), notifications_supported: state.notifications_supported !== false };
         case 'mode':
           state.mode = message.mode;
-          return { connected: true, configured: state.mode === 'new_chat' ? Boolean(state.directory) : Boolean(state.selected), url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames }, reply_count: state.reply_count || 10, default_delivery: state.default_delivery || 'queue', auth_method: state.auth_method || '' };
+          return { connected: true, configured: state.mode === 'new_chat' ? Boolean(state.directory) : Boolean(state.selected), url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames }, reply_count: state.reply_count || 10, default_delivery: state.default_delivery || 'queue', auth_method: state.auth_method || '', reply_alerts: Boolean(state.reply_alerts), notifications_supported: state.notifications_supported !== false };
         case 'list':
           return { sessions: listRows.map(row => ({ ...row })), next_cursor: null };
         case 'select':
           state.selected = { session_id: message.session_id, title: listRows.find(row => row.session_id === message.session_id).title };
-          return { connected: true, configured: true, url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames }, reply_count: state.reply_count || 10, default_delivery: state.default_delivery || 'queue', auth_method: state.auth_method || '' };
+          return { connected: true, configured: true, url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames }, reply_count: state.reply_count || 10, default_delivery: state.default_delivery || 'queue', auth_method: state.auth_method || '', reply_alerts: Boolean(state.reply_alerts), notifications_supported: state.notifications_supported !== false };
         case 'directory':
           state.directory = message.directory;
-          return { connected: true, configured: state.mode === 'new_chat' ? Boolean(state.directory) : Boolean(state.selected), url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames }, reply_count: state.reply_count || 10, default_delivery: state.default_delivery || 'queue', auth_method: state.auth_method || '' };
+          return { connected: true, configured: state.mode === 'new_chat' ? Boolean(state.directory) : Boolean(state.selected), url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames }, reply_count: state.reply_count || 10, default_delivery: state.default_delivery || 'queue', auth_method: state.auth_method || '', reply_alerts: Boolean(state.reply_alerts), notifications_supported: state.notifications_supported !== false };
         case 'reply_count':
           state.reply_count = message.count;
-          return { connected: true, configured: state.mode === 'new_chat' ? Boolean(state.directory) : Boolean(state.selected), url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames }, reply_count: state.reply_count, default_delivery: state.default_delivery || 'queue', auth_method: state.auth_method || '' };
+          return { connected: true, configured: state.mode === 'new_chat' ? Boolean(state.directory) : Boolean(state.selected), url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames }, reply_count: state.reply_count, default_delivery: state.default_delivery || 'queue', auth_method: state.auth_method || '', reply_alerts: Boolean(state.reply_alerts), notifications_supported: state.notifications_supported !== false };
         case 'default_delivery':
           if (message.delivery !== 'queue' && message.delivery !== 'steer') throw new Error('Invalid delivery.');
           state.default_delivery = message.delivery;
-          return { connected: true, configured: state.mode === 'new_chat' ? Boolean(state.directory) : Boolean(state.selected), url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames }, reply_count: state.reply_count || 10, default_delivery: state.default_delivery, auth_method: state.auth_method || '' };
+          return { connected: true, configured: state.mode === 'new_chat' ? Boolean(state.directory) : Boolean(state.selected), url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames }, reply_count: state.reply_count || 10, default_delivery: state.default_delivery, auth_method: state.auth_method || '', reply_alerts: Boolean(state.reply_alerts), notifications_supported: state.notifications_supported !== false };
+        case 'reply_alerts':
+          if (state.notifications_supported === false) throw new Error('Notifications are not supported on this device.');
+          state.reply_alerts = message.enabled === true;
+          return { connected: true, configured: state.mode === 'new_chat' ? Boolean(state.directory) : Boolean(state.selected), url: 'http://localhost:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames }, reply_count: state.reply_count || 10, default_delivery: state.default_delivery || 'queue', auth_method: state.auth_method || '', reply_alerts: Boolean(state.reply_alerts), notifications_supported: state.notifications_supported !== false };
         case 'pair':
           if (typeof message.link !== 'string' || !message.link) throw new Error('Pairing link required.');
           state.auth_method = 'pair';
-          return { connected: true, configured: state.mode === 'new_chat' ? Boolean(state.directory) : Boolean(state.selected), url: 'http://paired:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames }, reply_count: state.reply_count || 10, default_delivery: state.default_delivery || 'queue', auth_method: 'pair' };
+          return { connected: true, configured: state.mode === 'new_chat' ? Boolean(state.directory) : Boolean(state.selected), url: 'http://paired:4096', username: 'opencode', version: '2.2.1', mode: state.mode, directory: state.directory, selected: state.selected, nicknames: { ...state.nicknames }, reply_count: state.reply_count || 10, default_delivery: state.default_delivery || 'queue', auth_method: 'pair', reply_alerts: Boolean(state.reply_alerts), notifications_supported: state.notifications_supported !== false };
         default:
           throw new Error(`Unexpected plugin message: ${message.type}`);
       }
@@ -176,6 +180,36 @@ test('reply count initializes to 10, saves an exact integer, and rejects invalid
   assert.equal(ui.calls.filter(call => call.message.type === 'reply_count').length, before);
   assert.match(ui.document.getElementById('feedback').textContent, /1 to 20/i);
   assert.equal(ui.state.reply_count, 3);
+});
+
+test('reply notification setting defaults off, persists on save, and shows unsupported state', async () => {
+  const ui = setup({ ...initialNewModeState(), notifications_supported: true });
+  await ui.fireReady('plugin');
+  assert.equal(ui.calls.at(-1).message.type, 'status');
+  assert.equal(ui.document.getElementById('replyAlerts').checked, false);
+  assert.equal(ui.document.getElementById('replyAlerts').disabled, false);
+  assert.equal(ui.document.getElementById('saveReplyAlerts').disabled, false);
+  ui.document.getElementById('replyAlerts').checked = true;
+  await ui.click('saveReplyAlerts');
+  const saved = ui.calls.find(call => call.message.type === 'reply_alerts');
+  assert.deepEqual(saved.message, { type: 'reply_alerts', enabled: true });
+  assert.equal(ui.state.reply_alerts, true);
+  assert.equal(ui.document.getElementById('replyAlerts').checked, true);
+  assert.match(ui.document.getElementById('feedback').textContent, /enabled/i);
+
+  const refreshed = setup({ ...initialNewModeState(), reply_alerts: true, notifications_supported: true });
+  await refreshed.fireReady('plugin');
+  assert.equal(refreshed.document.getElementById('replyAlerts').checked, true);
+  refreshed.document.getElementById('replyAlerts').checked = false;
+  await refreshed.click('saveReplyAlerts');
+  assert.deepEqual(refreshed.calls.find(call => call.message.type === 'reply_alerts').message, { type: 'reply_alerts', enabled: false });
+  assert.equal(refreshed.state.reply_alerts, false);
+
+  const unsupported = setup({ ...initialNewModeState(), notifications_supported: false });
+  await unsupported.fireReady('plugin');
+  assert.equal(unsupported.document.getElementById('replyAlerts').disabled, true);
+  assert.equal(unsupported.document.getElementById('saveReplyAlerts').disabled, true);
+  assert.match(unsupported.document.getElementById('replyAlertsHint').textContent, /not supported/i);
 });
 
 test('pairing link form is separate from password form and saves paired method', async () => {

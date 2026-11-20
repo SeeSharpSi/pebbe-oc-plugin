@@ -13,7 +13,7 @@ function response(value, status = 200) {
   return { status, async json() { return value; } };
 }
 
-function harness() {
+function harness(options = {}) {
   const storage = new MemoryStorage();
   const requests = [];
   const routes = [];
@@ -34,7 +34,7 @@ function harness() {
   const route = (method, match, result) => routes.push({ method, match: typeof match === 'string' ? req => req.path === match : match, result });
   let tick = 1700000000000;
   let rand = 0;
-  const service = createService({ storage, fetch, now: () => tick, random: () => `r${++rand}` });
+  const service = createService({ storage, fetch, now: () => tick, random: () => `r${++rand}`, ...options });
   return { service, storage, requests, routes, unexpected, route, setNow(value) { tick = value; } };
 }
 

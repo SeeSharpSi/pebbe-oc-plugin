@@ -18,7 +18,7 @@ const manifest = require('../package.json').pebble;
 test('manifest and source/action declarations match public contract', () => {
   assert.equal(manifest.projectType, 'plugin');
   assert.equal(manifest.manifestVersion, 2);
-  assert.deepEqual(manifest.usesPermissions, ['Internet', 'LocalNetwork']);
+  assert.deepEqual(manifest.usesPermissions, ['Internet', 'LocalNetwork', { name: 'ShowNotifications', reason: 'To notify you when an OpenCode reply completes', required: false }]);
   const [chats, configured] = manifest.plugin.sources;
   assert.deepEqual([chats.category, chats.items, chats.properties, chats.suggestedRefreshIntervalSec], ['agent', ['chats'], { name: ['shortText'], title: ['shortText'], url: ['longText'] }, 900]);
   assert.deepEqual([configured.category, configured.items, configured.properties, configured.suggestedRefreshIntervalSec], ['agent', ['configured'], { name: ['shortText'], configured: ['boolean', 'shortText'] }, 60]);
@@ -93,7 +93,7 @@ test('queue, shell, and command actions require bounded explicit contracts and c
 
 test('status has exact public shape and omits secret', async () => {
   const h = harness();
-  assert.deepEqual(await h.service.config({ type: 'status' }), { connected: false, configured: false, url: '', username: 'opencode', version: '', mode: 'default_chat', directory: '', selected: null, nicknames: {}, reply_count: 10, default_delivery: 'queue', auth_method: '' });
+  assert.deepEqual(await h.service.config({ type: 'status' }), { connected: false, configured: false, url: '', username: 'opencode', version: '', mode: 'default_chat', directory: '', selected: null, nicknames: {}, reply_count: 10, default_delivery: 'queue', auth_method: '', reply_alerts: false, notifications_supported: false });
 });
 
 test('reply_count defaults to 10, accepts only integers 1..20, and persists without network', async () => {

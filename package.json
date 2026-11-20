@@ -1,7 +1,7 @@
 {
   "name": "pebble-opencode",
   "author": "OpenCode for Pebble contributors",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "private": true,
   "scripts": {
     "test": "node --test test/*.test.js",
@@ -14,7 +14,12 @@
     "sdkVersion": "3",
     "usesPermissions": [
       "Internet",
-      "LocalNetwork"
+      "LocalNetwork",
+      {
+        "name": "ShowNotifications",
+        "reason": "To notify you when an OpenCode reply completes",
+        "required": false
+      }
     ],
     "plugin": {
       "description": "Send messages; expose OpenCode execution, queue, shell, command, activity, replies, chat attention, permissions, questions, jobs, and session metrics; expose OpenCode Go usage only; interrupt foreground sessions.",

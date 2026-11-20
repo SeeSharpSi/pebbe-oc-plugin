@@ -4,6 +4,16 @@
   var STATE_KEY = 'opencode.plugin.state.v1';
   var SNAPSHOT_CACHE_KEY = 'opencode.plugin.cache.v1';
   var LEGACY_CACHE_META_KEY = 'opencode.plugin.cache.meta.v1';
+  var REPLY_ALERTS_KEY = 'opencode.plugin.reply-alerts.v1';
+  var REPLY_ALERTS_ENABLED_KEY = 'ocstatus.replyAlerts.enabled.v1';
+  var REPLY_LAUNCH_KEY = 'ocstatus.replyLaunch.v1';
+  var MAX_REPLY_ALERT_SESSIONS = 20;
+  var MAX_REPLY_ALERT_IDS = 20;
+  var MAX_REPLY_ALERT_BYTES = 16384;
+  var MAX_REPLY_NOTIFICATIONS = 5;
+  var MAX_LAUNCH_ROUTES = 20;
+  var LAUNCH_ROUTE_TTL_MS = 10 * 60 * 1000;
+  var MAX_LAUNCH_TOKEN = 2147483647;
   var SNAPSHOT_TTL_MS = 5000;
   var MAX_CACHE_TTL_MS = 60000;
   var MAX_CACHE_ENTRIES = 64;
@@ -113,7 +123,8 @@
     return {
       url: '', username: DEFAULT_USERNAME, password: '', version: '', mode: 'default_chat',
       directory: '', selected: null, lastSessionID: null, nicknames: {}, reply_count: DEFAULT_REPLY_COUNT,
-      default_delivery: DEFAULT_DELIVERY, auth_method: '', last_seen: {}, cache_generation: ''
+      default_delivery: DEFAULT_DELIVERY, auth_method: '', last_seen: {}, cache_generation: '',
+      reply_alerts: false
     };
   }
 
@@ -127,7 +138,9 @@
     var fetcher = options.fetch;
     var now = options.now || Date.now;
     var random = options.random;
+    var bundled = options.bundled !== undefined ? !!options.bundled : root.__ocStatusBundled === true;
     var cacheWriteChain = Promise.resolve();
+    var replyAlertChain = Promise.resolve();
     var sourceActiveMapInFlight = Object.create(null);
     var legacyCacheMetaInFlight = Object.create(null);
     var snapshotCacheContexts = new WeakMap();
@@ -152,6 +165,7 @@
           state.reply_count = DEFAULT_REPLY_COUNT;
         }
         if (!validDelivery(state.default_delivery)) state.default_delivery = DEFAULT_DELIVERY;
+        if (typeof state.reply_alerts !== 'boolean') state.reply_alerts = false;
         if (!state.password) state.auth_method = '';
         else if (state.auth_method !== 'pair') state.auth_method = 'password';
         return state;
@@ -437,7 +451,8 @@
         version: state.version || '', mode: state.mode || 'default_chat', directory: state.directory || '',
         selected: state.selected || null, nicknames: state.nicknames || {},
         reply_count: state.reply_count, default_delivery: state.default_delivery || DEFAULT_DELIVERY,
-        auth_method: state.auth_method || ''
+        auth_method: state.auth_method || '', reply_alerts: !!state.reply_alerts,
+        notifications_supported: notificationsSupported()
       };
     }
 
@@ -445,6 +460,271 @@
       if (!state.url || !state.username || !state.password || !/^2\./.test(state.version)) {
         throw makeError('AUTH_REQUIRED', 'Connect to an OpenCode V2 server first.');
       }
+    }
+
+    function notificationFunction() {
+      if (typeof options.showNotification === 'function') return options.showNotification;
+      if (root.Pebble && typeof root.Pebble.showNotification === 'function') {
+        return function (notification) { return root.Pebble.showNotification(notification); };
+      }
+      return null;
+    }
+
+    function notificationsSupported() {
+      return typeof notificationFunction() === 'function';
+    }
+
+    function appStorage() {
+      var candidate;
+      try { candidate = options.localStorage !== undefined ? options.localStorage : root.localStorage; }
+      catch (_) { return null; }
+      if (!candidate || typeof candidate.getItem !== 'function' || typeof candidate.setItem !== 'function' ||
+          typeof candidate.removeItem !== 'function') return null;
+      return candidate;
+    }
+
+    function syncReplyAlertsEnabled(enabled) {
+      var local = appStorage();
+      if (!local) return;
+      try {
+        if (enabled) local.setItem(REPLY_ALERTS_ENABLED_KEY, '1');
+        else local.removeItem(REPLY_ALERTS_ENABLED_KEY);
+      } catch (_) {}
+    }
+
+    function clearReplyLaunchRoutes() {
+      var local = appStorage();
+      if (!local) return;
+      try { local.removeItem(REPLY_LAUNCH_KEY); } catch (_) {}
+    }
+
+    async function clearReplyAlertState() {
+      clearReplyLaunchRoutes();
+      try { await storage.removeItem(REPLY_ALERTS_KEY); } catch (_) {}
+    }
+
+    function accountScope(state) {
+      var identity = String(state.url || '') + '\n' + String(state.username || '') + '\n' + String(state.password || '');
+      var hash = 2166136261;
+      for (var i = 0; i < identity.length; i += 1) {
+        hash ^= identity.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+      }
+      return String(state.url || '') + '\n' + String(state.username || '') + '\n' + (hash >>> 0).toString(36);
+    }
+
+    function validLaunchToken(key) {
+      if (typeof key !== 'string' || !/^[1-9][0-9]{0,9}$/.test(key)) return false;
+      var value = Number(key);
+      return value <= MAX_LAUNCH_TOKEN && value === Math.floor(value);
+    }
+
+    function readLaunchRoutes(local) {
+      var raw;
+      try { raw = local.getItem(REPLY_LAUNCH_KEY); } catch (_) { return null; }
+      if (raw === null || raw === undefined || raw === '') return {};
+      try {
+        var parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        if (!isPlainObject(parsed)) return {};
+        var keys = Object.keys(parsed);
+        if (keys.length > MAX_LAUNCH_ROUTES * 2) return {};
+        var current = now();
+        var routes = {};
+        keys.forEach(function (key) {
+          var route = parsed[key];
+          if (!validLaunchToken(key) || !isPlainObject(route) ||
+              Object.keys(route).sort().join(',') !== 'expiresAt,sessionId' ||
+              !sessionID(route.sessionId) || typeof route.expiresAt !== 'number' ||
+              !Number.isFinite(route.expiresAt) || route.expiresAt <= current) return;
+          routes[key] = { sessionId: route.sessionId, expiresAt: route.expiresAt };
+        });
+        return routes;
+      } catch (_) { return {}; }
+    }
+
+    function writeLaunchRoutes(local, routes) {
+      var keys = Object.keys(routes).sort(function (a, b) { return routes[b].expiresAt - routes[a].expiresAt; });
+      for (var i = MAX_LAUNCH_ROUTES; i < keys.length; i += 1) delete routes[keys[i]];
+      try { local.setItem(REPLY_LAUNCH_KEY, JSON.stringify(routes)); return true; }
+      catch (_) { return false; }
+    }
+
+    function randomLaunchToken() {
+      var value;
+      try {
+        if (typeof random === 'function') {
+          var candidate = random();
+          if (typeof candidate === 'number' && Number.isFinite(candidate)) value = candidate;
+        }
+      } catch (_) {}
+      if (typeof value === 'number') {
+        var fromRandom = Math.floor(Math.abs(value)) % MAX_LAUNCH_TOKEN;
+        return fromRandom + 1;
+      }
+      try {
+        if (root.crypto && typeof root.crypto.getRandomValues === 'function') {
+          var bytes = new Uint8Array(4);
+          root.crypto.getRandomValues(bytes);
+          var numeric = ((bytes[0] << 24) >>> 0) + (bytes[1] << 16) + (bytes[2] << 8) + bytes[3];
+          return (numeric % MAX_LAUNCH_TOKEN) + 1;
+        }
+      } catch (_) {}
+      return Math.floor(Math.random() * MAX_LAUNCH_TOKEN) + 1;
+    }
+
+    function createReplyRoute(sessionId) {
+      if (!bundled || !sessionID(sessionId)) return null;
+      var local = appStorage();
+      if (!local) return null;
+      var routes = readLaunchRoutes(local);
+      if (routes === null) return null;
+      var base = randomLaunchToken();
+      var token = null;
+      for (var attempt = 0; attempt < 8; attempt += 1) {
+        var candidate = ((base - 1 + attempt) % MAX_LAUNCH_TOKEN) + 1;
+        if (!Object.prototype.hasOwnProperty.call(routes, String(candidate))) { token = candidate; break; }
+      }
+      if (token === null) return null;
+      routes[String(token)] = { sessionId: sessionId, expiresAt: now() + LAUNCH_ROUTE_TTL_MS };
+      if (!writeLaunchRoutes(local, routes)) return null;
+      return token;
+    }
+
+    function sanitizeReplyAlertBook(raw, scope) {
+      if (raw === null || raw === undefined || raw === '') return null;
+      try {
+        var serialized = typeof raw === 'string' ? raw : JSON.stringify(raw);
+        if (typeof serialized !== 'string' || serializedByteLength(serialized) > MAX_REPLY_ALERT_BYTES) return null;
+        var book = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        if (!isPlainObject(book) || Object.keys(book).sort().join(',') !== 'scope,seededAt,sessions,version' ||
+            book.version !== 1 || typeof book.scope !== 'string' || book.scope !== scope ||
+            typeof book.seededAt !== 'number' || !Number.isFinite(book.seededAt) || book.seededAt < 0 ||
+            !isPlainObject(book.sessions) || Object.keys(book.sessions).length > MAX_REPLY_ALERT_SESSIONS) return null;
+        var sessions = {};
+        var keys = Object.keys(book.sessions);
+        for (var i = 0; i < keys.length; i += 1) {
+          var id = keys[i];
+          var record = book.sessions[id];
+          if (!sessionID(id) || !isPlainObject(record) || Object.keys(record).sort().join(',') !== 'completed,ids' ||
+              typeof record.completed !== 'number' || !Number.isFinite(record.completed) || record.completed < 0 ||
+              !Array.isArray(record.ids) || record.ids.length > MAX_REPLY_ALERT_IDS ||
+              record.ids.some(function (value, index) {
+                return !/^msg_[A-Za-z0-9_-]{1,196}$/.test(value) || record.ids.indexOf(value) !== index;
+              })) return null;
+          sessions[id] = { completed: record.completed, ids: record.ids.slice() };
+        }
+        return { version: 1, scope: scope, seededAt: book.seededAt, sessions: sessions };
+      } catch (_) { return null; }
+    }
+
+    async function loadReplyAlertBook(scope) {
+      var raw;
+      try { raw = await storage.getItem(REPLY_ALERTS_KEY); } catch (_) { return null; }
+      return sanitizeReplyAlertBook(raw, scope);
+    }
+
+    async function saveReplyAlertBook(book) {
+      var keys = Object.keys(book.sessions).sort(function (a, b) {
+        return book.sessions[b].completed - book.sessions[a].completed;
+      });
+      for (var i = MAX_REPLY_ALERT_SESSIONS; i < keys.length; i += 1) delete book.sessions[keys[i]];
+      Object.keys(book.sessions).forEach(function (id) {
+        var ids = book.sessions[id].ids;
+        if (ids.length > MAX_REPLY_ALERT_IDS) book.sessions[id].ids = ids.slice(ids.length - MAX_REPLY_ALERT_IDS);
+      });
+      var serialized = JSON.stringify(book);
+      if (serializedByteLength(serialized) > MAX_REPLY_ALERT_BYTES) return false;
+      try { await storage.setItem(REPLY_ALERTS_KEY, serialized); return true; }
+      catch (_) { return false; }
+    }
+
+    function recordCompletedReply(book, completed) {
+      if (!book.sessions[completed.sessionId]) book.sessions[completed.sessionId] = { completed: 0, ids: [] };
+      var record = book.sessions[completed.sessionId];
+      if (record.ids.indexOf(completed.id) === -1) record.ids.push(completed.id);
+      if (record.ids.length > MAX_REPLY_ALERT_IDS) record.ids = record.ids.slice(record.ids.length - MAX_REPLY_ALERT_IDS);
+      if (completed.completed > record.completed) record.completed = completed.completed;
+    }
+
+    function completedReplyAlert(entry) {
+      var reply = entry && entry.reply;
+      var message = reply && reply.message;
+      if (!message || typeof message.id !== 'string' || !/^msg_[A-Za-z0-9_-]{1,196}$/.test(message.id) ||
+          !message.time || typeof message.time.completed !== 'number' || !Number.isFinite(message.time.completed) ||
+          message.time.completed < 0 || typeof reply.text !== 'string' || !reply.text.trim()) return null;
+      return {
+        sessionId: entry.sessionId, id: message.id, completed: message.time.completed,
+        failed: !!(message.error || message.finish === 'error')
+      };
+    }
+
+    async function processReplyAlertsNow(state, entries) {
+      try {
+        if (!state.reply_alerts || !notificationsSupported()) return;
+        var fresh = await load();
+        if (!fresh.reply_alerts || !notificationsSupported() ||
+            fresh.url !== state.url || fresh.username !== state.username ||
+            fresh.password !== state.password || fresh.version !== state.version) return;
+        var completed = [];
+        entries.forEach(function (entry) {
+          var alert = completedReplyAlert(entry);
+          if (alert) completed.push(alert);
+        });
+        var scope = accountScope(fresh);
+        var book = await loadReplyAlertBook(scope);
+        if (!book) {
+          book = { version: 1, scope: scope, seededAt: now(), sessions: {} };
+          completed.forEach(function (alert) { recordCompletedReply(book, alert); });
+          await saveReplyAlertBook(book);
+          return;
+        }
+        var candidates = [];
+        completed.forEach(function (alert) {
+          var known = Object.prototype.hasOwnProperty.call(book.sessions, alert.sessionId);
+          var record = known ? book.sessions[alert.sessionId] : { completed: 0, ids: [] };
+          var existing = record.ids.indexOf(alert.id) !== -1;
+          var stale = alert.completed < book.seededAt || (known && alert.completed < record.completed);
+          if (!known) book.sessions[alert.sessionId] = record;
+          recordCompletedReply(book, alert);
+          if (!existing && !stale && !alert.failed) candidates.push(alert);
+        });
+        candidates.sort(function (a, b) {
+          return a.completed - b.completed || (a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 :
+            a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+        });
+        var seen = Object.create(null);
+        var unique = candidates.filter(function (alert) {
+          var key = alert.sessionId + '\n' + alert.id;
+          if (seen[key]) return false;
+          seen[key] = true;
+          return true;
+        }).slice(0, MAX_REPLY_NOTIFICATIONS);
+        if (!await saveReplyAlertBook(book)) return;
+        for (var i = 0; i < unique.length; i += 1) {
+          var current = await load();
+          if (!current.reply_alerts || !notificationsSupported() ||
+              current.url !== state.url || current.username !== state.username ||
+              current.password !== state.password || current.version !== state.version) return;
+          var token = createReplyRoute(unique[i].sessionId);
+          var notification = {
+            layout: {
+              type: 'genericNotification', title: 'OpenCode reply ready',
+              tinyIcon: 'system://images/NOTIFICATION_GENERIC'
+            },
+            actions: token === null ? [] : [{ title: 'Open reply', type: 'openWatchApp', launchCode: token }]
+          };
+          try {
+            var pending = notificationFunction()(notification);
+            if (pending && typeof pending.catch === 'function') await pending.catch(function () {});
+          } catch (_) {}
+        }
+      } catch (_) {}
+    }
+
+    function processReplyAlerts(state, entries) {
+      var task = replyAlertChain.then(function () { return processReplyAlertsNow(state, entries); });
+      replyAlertChain = task.catch(function () {});
+      return task;
     }
 
     async function request(state, path, method, body, expectedStatus) {
@@ -1122,9 +1402,9 @@
       ordered = ordered.slice(0, state.reply_count);
 
       var limit = createLimiter(4);
-      var instances;
+      var entries;
       try {
-        instances = await Promise.all(ordered.map(function (entry) {
+        entries = await Promise.all(ordered.map(function (entry) {
           return limit(async function () {
             var meta = entry.meta;
             if (!meta) {
@@ -1137,14 +1417,15 @@
               };
             }
             var reply = await sourceAssistantReply(state, meta.session_id, meta.sessionInfo);
-            return repliesInstance(state, meta, reply, defaultID);
+            return { instance: repliesInstance(state, meta, reply, defaultID), reply: reply, sessionId: meta.session_id };
           });
         }));
       } catch (err) {
         limit.stop(err);
         throw err;
       }
-      return { validUntilMs: now() + 60000, instances: instances };
+      if (state.reply_alerts && notificationsSupported()) await processReplyAlerts(state, entries);
+      return { validUntilMs: now() + 60000, instances: entries.map(function (entry) { return entry.instance; }) };
     }
 
     function validPermissionRequest(item) {
@@ -1948,7 +2229,10 @@
       if (!input || typeof input !== 'object' || Array.isArray(input)) throw makeError('INVALID_REQUEST', 'Invalid configuration request.');
       var state = await load();
       var type = input.type;
-      if (type === 'status' || type === undefined) return status(state);
+      if (type === 'status' || type === undefined) {
+        syncReplyAlertsEnabled(!!state.reply_alerts);
+        return status(state);
+      }
 
       if (type === 'connect') {
         var url = cleanURL(input.url);
@@ -1970,6 +2254,8 @@
         candidate.version = version;
         await invalidateSnapshotCache(candidate);
         await save(candidate);
+        if (state.url !== url || state.username !== username) await clearReplyAlertState();
+        else clearReplyLaunchRoutes();
         refresh();
         return status(candidate);
       }
@@ -2001,6 +2287,8 @@
         pairCandidate.version = pairVersion;
         await invalidateSnapshotCache(pairCandidate);
         await save(pairCandidate);
+        if (state.url !== paired.origin || state.username !== DEFAULT_USERNAME) await clearReplyAlertState();
+        else clearReplyLaunchRoutes();
         refresh();
         return status(pairCandidate);
       }
@@ -2008,6 +2296,8 @@
       if (type === 'disconnect') {
         try { await storage.removeItem(STATE_KEY); await storage.removeItem(SNAPSHOT_CACHE_KEY); await storage.removeItem(LEGACY_CACHE_META_KEY); }
         catch (_) { throw makeError('PLUGIN_UNAVAILABLE', 'Secure storage is unavailable.'); }
+        await clearReplyAlertState();
+        syncReplyAlertsEnabled(false);
         refresh();
         return status(emptyState());
       }
@@ -2065,6 +2355,22 @@
         if (!validDelivery(input.delivery)) throw makeError('INVALID_ARGS', 'Delivery must be queue or steer.');
         state.default_delivery = input.delivery;
         await save(state);
+        return status(state);
+      }
+
+      if (type === 'reply_alerts') {
+        if (typeof input.enabled !== 'boolean') throw makeError('INVALID_ARGS', 'Reply notification setting must be on or off.');
+        if (input.enabled && !notificationsSupported()) {
+          throw makeError('PLUGIN_UNAVAILABLE', 'Notifications are not supported on this device.');
+        }
+        var replyAlertsChanged = state.reply_alerts !== input.enabled;
+        if (replyAlertsChanged) {
+          state.reply_alerts = input.enabled;
+          await save(state);
+          if (input.enabled) clearReplyLaunchRoutes();
+          else await clearReplyAlertState();
+        }
+        syncReplyAlertsEnabled(input.enabled);
         return status(state);
       }
 

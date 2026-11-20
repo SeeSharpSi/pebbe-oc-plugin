@@ -24,6 +24,7 @@
     .field { min-width:0; }
     label, legend { display:block; margin:0 0 5px; font-weight:600; }
     input:not([type=radio]), select { width:100%; min-height:40px; padding:8px 10px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--text); font:inherit; }
+    input[type=checkbox] { width:auto; min-height:auto; padding:0; accent-color:var(--accent); }
     input[type=radio] { accent-color:var(--accent); }
     button { min-height:38px; padding:7px 12px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--text); font:inherit; cursor:pointer; }
     button.primary { border-color:var(--accent); background:var(--accent); color:#fff; }
@@ -120,6 +121,13 @@
     </div>
   </section>
 
+  <section class="card" aria-labelledby="replyAlertsHeading">
+    <h2 id="replyAlertsHeading">Reply notifications</h2>
+    <div class="choice"><input id="replyAlerts" type="checkbox"><label for="replyAlerts">Notify me when an OpenCode reply completes</label></div>
+    <p id="replyAlertsHint" class="hint">Off by default. Notifications do not include reply text or session titles. Bundled apps can offer an Open reply action.</p>
+    <div class="actions"><button id="saveReplyAlerts" type="button" disabled>Save notifications</button></div>
+  </section>
+
   <section id="recentSessions" class="card" aria-labelledby="sessionsHeading">
     <h2 id="sessionsHeading">Recent sessions</h2>
     <p class="hint">Titles can repeat. Directory and default markers help distinguish sessions.</p>
@@ -141,7 +149,7 @@
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
-  const state = { ready:false, connected:false, configured:false, busy:false, mode:'default_chat', directory:'', selected:null, nicknames:{}, sessions:[], cursor:null, projects:[], version:'', url:'', username:'opencode', replyCount:10, defaultDelivery:'queue', authMethod:'' };
+  const state = { ready:false, connected:false, configured:false, busy:false, mode:'default_chat', directory:'', selected:null, nicknames:{}, sessions:[], cursor:null, projects:[], version:'', url:'', username:'opencode', replyCount:10, defaultDelivery:'queue', authMethod:'', replyAlerts:false, notificationsSupported:false };
   let editingSessionId=null;
   const controls = ['connectButton','testButton','disconnectButton','modeOptions','directory','saveDirectory','loadProjects','projectSelect','searchSessions','refreshSessions','loadMore','nickname','saveNickname','clearNickname','useDefault'];
   function feedback(message,error=false) { $('feedback').textContent=message||''; $('feedback').classList.toggle('error',error); $('feedback').setAttribute('role',error?'alert':'status'); }
@@ -176,6 +184,12 @@
     for(const id of ['nickname','saveNickname','clearNickname','useDefault']) $(id).disabled=!state.ready||state.busy||!state.connected||!selected;
     $('replyCount').value=String(state.replyCount); $('replyCount').disabled=!state.ready||state.busy; $('saveReplyCount').disabled=!state.ready||state.busy;
     $('defaultDelivery').value=state.defaultDelivery; $('defaultDelivery').disabled=!state.ready||state.busy; $('saveDelivery').disabled=!state.ready||state.busy;
+    $('replyAlerts').checked=state.replyAlerts;
+    $('replyAlerts').disabled=!state.ready||state.busy||!state.notificationsSupported;
+    $('saveReplyAlerts').disabled=!state.ready||state.busy||!state.notificationsSupported;
+    $('replyAlertsHint').textContent=state.notificationsSupported
+      ?'Off by default. Notifications do not include reply text or session titles. Bundled apps can offer an Open reply action.'
+      :'Notifications are not supported by this device or app version.';
     renderProjects(); renderSessions();
   }
   function resetRemoteData(){
@@ -225,6 +239,8 @@
     state.mode=data.mode||'default_chat';state.directory=data.directory||'';state.selected=data.selected||null;state.nicknames=data.nicknames||{};
     if(Number.isInteger(data.reply_count))state.replyCount=data.reply_count;
     if(data.default_delivery==='queue'||data.default_delivery==='steer')state.defaultDelivery=data.default_delivery;
+    state.replyAlerts=data.reply_alerts===true;
+    state.notificationsSupported=data.notifications_supported!==false;
     state.authMethod=data.auth_method==='pair'?'pair':data.auth_method==='password'?'password':'';
     $('serverUrl').value=state.url||'';$('username').value=state.username||'opencode';$('directory').value=state.directory;$('nickname').value=editingSessionId?(state.nicknames[editingSessionId]||''):'';
     if(!data.connected)$('connectDetails').open=true;
@@ -370,6 +386,13 @@
       if(delivery!=='queue'&&delivery!=='steer')throw new Error('Choose queue or steer.');
       applyStatus(await send({type:'default_delivery',delivery}));
       feedback('Default delivery saved.');
+    });
+  });
+  $('saveReplyAlerts').addEventListener('click',()=>{
+    const enabled=Boolean($('replyAlerts').checked);
+    run(async()=>{
+      applyStatus(await send({type:'reply_alerts',enabled}));
+      feedback(enabled?'Reply notifications enabled.':'Reply notifications disabled.');
     });
   });
   function onReady(event){
