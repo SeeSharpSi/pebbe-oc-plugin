@@ -1,7 +1,7 @@
 {
   "name": "pebble-opencode",
   "author": "OpenCode for Pebble contributors",
-  "version": "0.9.4",
+  "version": "0.9.5",
   "private": true,
   "scripts": {
     "test": "node --test test/*.test.js",
@@ -631,7 +631,7 @@
       "actions": [
         {
           "name": "send_to_agent",
-          "description": "Send a message to an existing OpenCode session or start a new session in a directory. chat_id may identify a session by its ID, nickname, or unambiguous title; use \"new\" to start a session in the configured directory. Omit chat_id to follow settings: use the configured default session or start a new one. The optional delivery parameter queues the message until the current run finishes or steers it into the active run; omit it to use the plugin default. Returns a receipt for the requested delivery mode, not OpenCode's reply. Do not automatically retry uncertain delivery or conflicts.",
+          "description": "Send a message to an existing OpenCode session or start a new session in a directory. chat_id may identify a session by its ID, nickname, or unambiguous title; use \"new\" to start a session in the configured directory. Archived sessions must be targeted by explicit ID or nickname and are unarchived when OpenCode accepts the message. Omit chat_id to follow settings: use the configured default session or start a new one. The optional delivery parameter queues the message until the current run finishes or steers it into the active run; omit it to use the plugin default. Returns a receipt for the requested delivery mode, not OpenCode's reply. Do not automatically retry uncertain delivery or conflicts.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -874,7 +874,7 @@
         },
         {
           "name": "run_command",
-          "description": "Invoke an exact registered OpenCode command in an explicit live unarchived session. Rediscover the command at its location before execution. This action exposes registered command invocation, not arbitrary shell invocation; the command may itself use tools or run shell commands under OpenCode's configured permissions. Do not retry uncertain outcomes.",
+          "description": "Invoke an exact registered OpenCode command in an explicit session. Archived sessions are unarchived when OpenCode accepts the command. Rediscover the command at its location before execution. This action exposes registered command invocation, not arbitrary shell invocation; the command may itself use tools or run shell commands under OpenCode's configured permissions. Do not retry uncertain outcomes.",
           "parameters": {
             "type": "object",
             "properties": {

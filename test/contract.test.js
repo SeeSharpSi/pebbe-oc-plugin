@@ -300,6 +300,33 @@ test('direct ID send, returns queued receipt description and does not include mo
   assert.match(h.requests.find(req => req.path.endsWith('/prompt')).body.id, /^msg_/);
 });
 
+test('send semanticResult names the direct session recipient without claiming completion', async () => {
+  const h = harness(); await connected(h); addPrompt(h, 'ses_a', 'Alpha');
+  const result = await h.service.action({ action: 'send_to_agent', args: { message: 'hello', chat_id: 'ses_a' } });
+  assert.equal(result.semanticResult, '{"type":"MESSAGE_SENT","recipientName":"Alpha","text":"hello","contactId":"ses_a"}');
+  assert.deepEqual(JSON.parse(result.semanticResult), {
+    type: 'MESSAGE_SENT', recipientName: 'Alpha', text: 'hello', contactId: 'ses_a'
+  });
+  assert.equal(Object.hasOwn(JSON.parse(result.semanticResult), 'complete'), false);
+});
+
+test('send semanticResult prefers a saved nickname for an existing session', async () => {
+  const h = harness(); await connected(h); addLiveSession(h, 'ses_a');
+  await h.service.config({ type: 'save_session', session_id: 'ses_a', nickname: 'Work' });
+  addPrompt(h, 'ses_a', 'Work');
+  const result = await h.service.action({ action: 'send_to_agent', args: { message: 'hello', chat_id: 'work' } });
+  assert.equal(result.semanticResult, '{"type":"MESSAGE_SENT","recipientName":"Work","text":"hello","contactId":"ses_a"}');
+});
+
+test('send semanticResult names a newly created session OpenCode', async () => {
+  const h = harness(); await connected(h);
+  await h.service.config({ type: 'directory', directory: '/workspace' });
+  h.route('POST', '/api/session', response({ data: session('ses_new', 'Pebble') }));
+  addPrompt(h, 'ses_new', 'Pebble');
+  const result = await h.service.action({ action: 'send_to_agent', args: { message: 'hello', chat_id: 'new' } });
+  assert.equal(result.semanticResult, '{"type":"MESSAGE_SENT","recipientName":"OpenCode","text":"hello","contactId":"ses_new"}');
+});
+
 test('default target resolves selected session and list is not needed', async () => {
   const h = harness(); await connected(h); addLiveSession(h, 'ses_a');
   await h.service.config({ type: 'select', session_id: 'ses_a' });
@@ -395,11 +422,14 @@ test('invalid args, unknown action, blank/oversized prompt, and partial session 
   assert.equal(h.requests.some(req => req.method === 'POST'), false);
 });
 
-test('archived explicit target never receives prompt', async () => {
+test('archived explicit target posts and returns a receipt', async () => {
   const h = harness(); await connected(h);
   addLiveSession(h, 'ses_old', session('ses_old', 'Old', { time: { archived: 1700000000 } }));
-  await assert.rejects(h.service.action({ action: 'send_to_agent', args: { message: 'hello', chat_id: 'ses_old' } }));
-  assert.equal(h.requests.some(req => req.method === 'POST'), false);
+  h.route('POST', '/api/session/ses_old/prompt', req => response(makeAck('ses_old', req.body.id, 'hello')));
+  const result = await h.service.action({ action: 'send_to_agent', args: { message: 'hello', chat_id: 'ses_old' } });
+  assert.match(result.text, /Old/);
+  assert.equal(h.requests.filter(req => req.method === 'POST' && req.path === '/api/session/ses_old/prompt').length, 1);
+  assert.equal(JSON.parse(result.semanticResult).contactId, 'ses_old');
 });
 
 test('live-session response with wrong ID rejects before prompt', async () => {

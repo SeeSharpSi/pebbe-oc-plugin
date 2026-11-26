@@ -188,7 +188,99 @@ test('notification failure and unavailable app storage never fail the replies so
   addReplies(h, [completed('msg_new', 'new', 1700000059000)], 1700000059000);
   const result = await source(h);
   assert.equal(result.instances.length, 1);
-  assert.ok(h.storage.values.get(ALERTS_KEY), 'bookkeeping still persists despite notification failure');
+  const book = JSON.parse(h.storage.values.get(ALERTS_KEY));
+  assert.equal(book.sessions.ses_reply.ids.includes('msg_new'), false, 'failed notification must remain eligible for retry');
+});
+
+test('denied permission skips notifications without consuming candidates until granted', async () => {
+  let permission = 'denied';
+  const notifications = [];
+  const h = makeHarness({
+    queryPermission: permissionName => {
+      assert.equal(permissionName, 'ShowNotifications');
+      return permission;
+    },
+    showNotification: notification => notifications.push(notification)
+  });
+  addReplies(h, [completed('msg_old', 'old', 1700000001000)]);
+  await source(h);
+  assert.equal(notifications.length, 0);
+
+  h.setNow(1700000060000);
+  addReplies(h, [completed('msg_new', 'new', 1700000059000)], 1700000059000);
+  await source(h);
+  assert.equal(notifications.length, 0, 'denied permission must not post');
+  assert.equal(JSON.parse(h.storage.values.get(ALERTS_KEY)).sessions.ses_reply.ids.includes('msg_new'), false);
+
+  permission = 'granted';
+  addReplies(h, [completed('msg_new', 'new', 1700000059000)], 1700000059000);
+  await source(h);
+  assert.equal(notifications.length, 1, 'same completion must alert once permission is granted');
+  assert.equal(JSON.parse(h.storage.values.get(ALERTS_KEY)).sessions.ses_reply.ids.includes('msg_new'), true);
+});
+
+test('throwing or rejected notifications remain eligible and later post', async () => {
+  let mode = 'throw';
+  const notifications = [];
+  const h = makeHarness({
+    queryPermission: async () => 'granted',
+    showNotification: notification => {
+      if (mode === 'throw') throw new Error('notification failed');
+      if (mode === 'reject') return Promise.reject(new Error('notification rejected'));
+      notifications.push(notification);
+    }
+  });
+  addReplies(h, [completed('msg_old', 'old', 1700000001000)]);
+  await source(h);
+
+  h.setNow(1700000060000);
+  addReplies(h, [completed('msg_new', 'new', 1700000059000)], 1700000059000);
+  await source(h);
+  assert.equal(JSON.parse(h.storage.values.get(ALERTS_KEY)).sessions.ses_reply.ids.includes('msg_new'), false);
+
+  mode = 'reject';
+  addReplies(h, [completed('msg_new', 'new', 1700000059000)], 1700000059000);
+  await source(h);
+  assert.equal(notifications.length, 0);
+  assert.equal(JSON.parse(h.storage.values.get(ALERTS_KEY)).sessions.ses_reply.ids.includes('msg_new'), false);
+
+  mode = 'ok';
+  addReplies(h, [completed('msg_new', 'new', 1700000059000)], 1700000059000);
+  await source(h);
+  assert.equal(notifications.length, 1, 'same completion must alert after notification recovers');
+});
+
+test('granted permission posts once and consumes the completed reply', async () => {
+  const notifications = [];
+  const h = makeHarness({
+    queryPermission: async () => 'granted',
+    showNotification: notification => notifications.push(notification)
+  });
+  addReplies(h, [completed('msg_old', 'old', 1700000001000)]);
+  await source(h);
+  h.setNow(1700000060000);
+  addReplies(h, [completed('msg_new', 'new', 1700000059000)], 1700000059000);
+  await source(h);
+  assert.equal(notifications.length, 1);
+  assert.equal(JSON.parse(h.storage.values.get(ALERTS_KEY)).sessions.ses_reply.ids.includes('msg_new'), true);
+  addReplies(h, [completed('msg_new', 'new', 1700000059000)], 1700000059000);
+  await source(h);
+  assert.equal(notifications.length, 1);
+});
+
+test('enabling reply alerts fails clearly when notifications are denied', async () => {
+  const local = new LocalStorage();
+  const h = makeHarness({
+    localStorage: local,
+    queryPermission: async () => 'denied',
+    showNotification: () => {}
+  }, { reply_alerts: false });
+  await assert.rejects(h.service.config({ type: 'reply_alerts', enabled: true }),
+    error => error.code === 'PERMISSION_DENIED' && /Pebble app/i.test(error.message));
+  const stored = h.storage.values.get(KEY);
+  const state = typeof stored === 'string' ? JSON.parse(stored) : stored;
+  assert.equal(state.reply_alerts, false);
+  assert.equal(local.getItem(ENABLED_KEY), null);
 });
 
 test('notification setting persists, syncs the app flag, and rejects unsupported devices', async () => {

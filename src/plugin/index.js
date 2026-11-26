@@ -474,6 +474,24 @@
       return typeof notificationFunction() === 'function';
     }
 
+    function permissionQueryFunction() {
+      if (typeof options.queryPermission === 'function') return options.queryPermission;
+      if (root.Pebble && root.Pebble.permissions && typeof root.Pebble.permissions.query === 'function') {
+        return function (permission) { return root.Pebble.permissions.query(permission); };
+      }
+      return null;
+    }
+
+    async function notificationPermission() {
+      var query = permissionQueryFunction();
+      if (!query) return 'unknown';
+      try {
+        var result = await query('ShowNotifications');
+        if (result === 'granted' || result === 'prompt' || result === 'denied') return result;
+      } catch (_) {}
+      return 'unknown';
+    }
+
     function appStorage() {
       var candidate;
       try { candidate = options.localStorage !== undefined ? options.localStorage : root.localStorage; }
@@ -646,6 +664,13 @@
       if (completed.completed > record.completed) record.completed = completed.completed;
     }
 
+    function forgetCompletedReply(book, completed) {
+      var record = book.sessions[completed.sessionId];
+      if (!record) return;
+      var index = record.ids.indexOf(completed.id);
+      if (index !== -1) record.ids.splice(index, 1);
+    }
+
     function completedReplyAlert(entry) {
       var reply = entry && entry.reply;
       var message = reply && reply.message;
@@ -699,12 +724,20 @@
           seen[key] = true;
           return true;
         }).slice(0, MAX_REPLY_NOTIFICATIONS);
-        if (!await saveReplyAlertBook(book)) return;
+        if (!unique.length) {
+          await saveReplyAlertBook(book);
+          return;
+        }
+        var permission = await notificationPermission();
+        // Leave the stored book untouched while denied so every completion stays eligible
+        // for a later alert, including several replies that completed in the same session.
+        if (permission === 'denied') return;
+        var posted = Object.create(null);
         for (var i = 0; i < unique.length; i += 1) {
           var current = await load();
           if (!current.reply_alerts || !notificationsSupported() ||
               current.url !== state.url || current.username !== state.username ||
-              current.password !== state.password || current.version !== state.version) return;
+              current.password !== state.password || current.version !== state.version) break;
           var token = createReplyRoute(unique[i].sessionId);
           var notification = {
             layout: {
@@ -715,9 +748,18 @@
           };
           try {
             var pending = notificationFunction()(notification);
-            if (pending && typeof pending.catch === 'function') await pending.catch(function () {});
+            if (pending && typeof pending.catch === 'function') {
+              var delivered = await pending.then(function () { return true; }, function () { return false; });
+              if (delivered) posted[unique[i].sessionId + '\n' + unique[i].id] = true;
+            } else {
+              posted[unique[i].sessionId + '\n' + unique[i].id] = true;
+            }
           } catch (_) {}
         }
+        candidates.forEach(function (alert) {
+          if (!posted[alert.sessionId + '\n' + alert.id]) forgetCompletedReply(book, alert);
+        });
+        await saveReplyAlertBook(book);
       } catch (_) {}
     }
 
@@ -796,6 +838,9 @@
     function sessionPath(id) { return '/session/' + encodeURIComponent(id); }
     function titleOf(session) { return typeof session.title === 'string' && session.title ? session.title : 'Untitled session'; }
     function archived(session) { return !!(session.time && session.time.archived); }
+    function messageSentResult(recipientName, text, contactId) {
+      return JSON.stringify({ type: 'MESSAGE_SENT', recipientName: recipientName, text: text, contactId: contactId });
+    }
 
     function validSession(session) {
       if (!session || typeof session !== 'object' || !sessionID(session.id) ||
@@ -2052,7 +2097,6 @@
           args.text !== undefined && (typeof args.text !== 'string' || args.text.length > 16000 || !validUnicodeString(args.text) || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/.test(args.text)) ||
           args.delivery !== undefined && !validDelivery(args.delivery)) throw makeError('INVALID_ARGS', 'Invalid command request.');
       var session = await getSession(state, args.session_id);
-      if (archived(session)) throw makeError('INVALID_ARGS', 'Archived sessions cannot run commands.');
       var directory = session.location.directory;
       if (!directoryPath(directory)) throw makeError('INVALID_ARGS', 'Session location is invalid.');
       var response;
@@ -2362,6 +2406,9 @@
         if (typeof input.enabled !== 'boolean') throw makeError('INVALID_ARGS', 'Reply notification setting must be on or off.');
         if (input.enabled && !notificationsSupported()) {
           throw makeError('PLUGIN_UNAVAILABLE', 'Notifications are not supported on this device.');
+        }
+        if (input.enabled && await notificationPermission() === 'denied') {
+          throw makeError('PERMISSION_DENIED', 'Notifications are disabled for this app. Allow notifications in the Pebble app, then try again.');
         }
         var replyAlertsChanged = state.reply_alerts !== input.enabled;
         if (replyAlertsChanged) {
@@ -2801,6 +2848,7 @@
       }
       var create = /^(new|new chat)$/i.test(target);
       var session;
+      var recipientName = 'OpenCode';
       if (!create) {
         var id = null;
         if (sessionID(target)) id = target;
@@ -2827,13 +2875,12 @@
         }
         if (!sessionID(id)) throw makeError('INVALID_ARGS', 'Invalid session ID.');
         session = await getSession(state, id);
-        if (archived(session)) throw makeError('INVALID_ARGS', 'Archived sessions cannot receive messages.');
+        recipientName = state.nicknames[session.id] || titleOf(session);
       } else {
         if (!directoryPath(state.directory)) throw makeError('INVALID_ARGS', 'Set an absolute server directory before creating a session.');
         await invalidateBeforeMutation(state);
         var created = await api(state, '/session', 'POST', { title: 'Pebble', location: { directory: state.directory } });
         session = validSession(created && created.data);
-        if (archived(session)) throw makeError('INVALID_ARGS', 'Archived sessions cannot receive messages.');
       }
 
       var messageID = makeMessageID();
@@ -2880,6 +2927,7 @@
       await invalidateAfterMutation(state);
       return {
         text: (delivery === 'steer' ? 'Message steered into OpenCode: ' : 'Message queued for OpenCode: ') + titleOf(session) + (focusWarning ? ' Focus not saved.' : ''),
+        semanticResult: messageSentResult(recipientName, message, session.id),
         refreshed: sourceRefreshes()
       };
     }

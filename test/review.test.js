@@ -190,11 +190,10 @@ test('delivery update validates explicit mode and patches once after live owner 
   assert.equal(invalid.requests.length, 0);
 });
 
-test('archived sessions block queue mutations and command execution before mutation', async () => {
+test('archived sessions block queue mutations before mutation', async () => {
   for (const [name, args] of [
     ['cancel_queued_message', { session_id: 'ses_focus', inbox_id: 'msg_inbox1' }],
-    ['set_queued_delivery', { session_id: 'ses_focus', inbox_id: 'msg_inbox1', delivery: 'queue' }],
-    ['run_command', { session_id: 'ses_focus', command: 'deploy' }]
+    ['set_queued_delivery', { session_id: 'ses_focus', inbox_id: 'msg_inbox1', delivery: 'queue' }]
   ]) {
     const h = harness();
     addSession(h, 'ses_focus', session('ses_focus', 'Archived', { time: { archived: 1700000000 } }));
@@ -202,6 +201,22 @@ test('archived sessions block queue mutations and command execution before mutat
     assert.equal(h.requests.filter(req => req.method === 'GET' && req.path === '/api/session/ses_focus').length, 1);
     assert.equal(h.requests.some(req => ['POST', 'PATCH', 'DELETE'].includes(req.method)), false);
   }
+});
+
+test('archived session run_command rediscovers and posts once', async () => {
+  const h = harness();
+  addSession(h, 'ses_focus', session('ses_focus', 'Archived', { time: { archived: 1700000000 } }));
+  h.route('GET', req => req.path === '/api/command', req => {
+    location(req, '/workspace');
+    return response({ location: { directory: '/workspace' }, data: [{ name: 'deploy' }] });
+  });
+  h.route('POST', '/api/session/ses_focus/command', req => {
+    assert.deepEqual(req.body, { name: 'deploy', text: '', delivery: 'queue' });
+    return response(null, 204);
+  });
+  const result = await action(h, 'run_command', { session_id: 'ses_focus', command: 'deploy' });
+  assert.match(result.text, /Command invocation sent/);
+  assert.equal(h.requests.filter(req => req.method === 'POST').length, 1);
 });
 
 test('shell and command sources use focused session location, not shell cwd, and omit raw output', async () => {
